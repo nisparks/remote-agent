@@ -807,16 +807,21 @@ function applySessionPayload(data, scrollBottom = false) {
 
   renderSessionHeader();
   renderAgentHierarchyBar();
+  renderActionBanner();
+  renderWorkspaceStatusBar();
   renderTurns(scrollBottom);
   renderArtifactsGallery();
   renderReviewsQueue();
   renderTodosAndMcps();
-  renderActionBanner();
-  renderWorkspaceStatusBar();
+  if (scrollBottom || state.stickToBottom) {
+    scrollStreamToBottomIfSticky(scrollBottom);
+  }
 }
 
 async function selectSession(sessionId) {
   state.activeSessionId = sessionId;
+  state.activeSubAgentId = null;
+  state.activeDetachedShellId = null;
   state.stickToBottom = true;
   updateJumpToBottomButton();
   localStorage.setItem("ra_active_session_id", sessionId);
@@ -829,7 +834,7 @@ async function selectSession(sessionId) {
   const cached = state.sessionCache.get(sessionId);
   if (cached) {
     applySessionPayload(cached, true);
-    // Revalidate quietly in background without resetting scroll
+    // Revalidate in background while keeping stickToBottom active
     loadSessionDetail(sessionId, false);
   } else {
     // Immediately update header from state.sessions summary so title switches in 0ms
@@ -840,9 +845,12 @@ async function selectSession(sessionId) {
     }
     state.turns = [];
     state.artifacts = [];
+    state.subAgents = [];
+    state.detachedShells = [];
     state.todos = [];
     state.reviews = [];
     state.pendingSteering = [];
+    renderAgentHierarchyBar();
     const container = document.getElementById("turnsContainer");
     if (container) {
       container.innerHTML = `<div style="text-align:center;padding:28px;color:var(--text-secondary);">Loading session...</div>`;
@@ -868,6 +876,8 @@ async function loadSessionDetail(sessionId, scrollBottom = false) {
       prevCached &&
       prevCached.turns?.length === data.turns?.length &&
       prevCached.artifacts?.length === data.artifacts?.length &&
+      prevCached.subAgents?.length === data.subAgents?.length &&
+      prevCached.detachedShells?.length === data.detachedShells?.length &&
       prevCached.pendingSteering?.length === data.pendingSteering?.length &&
       prevCached.turns?.[prevCached.turns.length - 1]?.content ===
         data.turns?.[data.turns.length - 1]?.content &&
@@ -877,10 +887,13 @@ async function loadSessionDetail(sessionId, scrollBottom = false) {
       state.activeSession = data.session;
       renderSessionHeader();
       renderActionBanner();
+      if (state.stickToBottom) {
+        scrollStreamToBottomIfSticky(false);
+      }
       return;
     }
 
-    applySessionPayload(data, scrollBottom);
+    applySessionPayload(data, scrollBottom || state.stickToBottom);
   } catch (err) {
     console.error("Failed to load session detail:", err);
   }
@@ -1379,13 +1392,23 @@ function updateJumpToBottomButton() {
   btn.style.display = !state.stickToBottom && state.activeTab === "stream" ? "inline-flex" : "none";
 }
 
+let programmaticScrollUntil = 0;
+
 function scrollStreamToBottomIfSticky(force = false) {
   const pane = document.getElementById("tab-stream");
   if (!pane) return;
   if (force || state.stickToBottom) {
-    pane.scrollTop = pane.scrollHeight;
     state.stickToBottom = true;
+    programmaticScrollUntil = Date.now() + 180;
+    pane.scrollTop = pane.scrollHeight;
     updateJumpToBottomButton();
+    requestAnimationFrame(() => {
+      if (force || state.stickToBottom) {
+        programmaticScrollUntil = Date.now() + 180;
+        pane.scrollTop = pane.scrollHeight;
+        updateJumpToBottomButton();
+      }
+    });
   }
 }
 
@@ -2014,6 +2037,21 @@ function renderTurns(scrollBottom = false) {
       const art = state.artifacts.find((a) => a.id === id);
       if (art) openArtifactViewer(art);
     });
+  });
+
+  // Keep stream pinned to bottom if inline thumbnail images decode asynchronously while sticky
+  container.querySelectorAll("img.inline-artifact-thumb").forEach((img) => {
+    if (!img.complete) {
+      img.addEventListener(
+        "load",
+        () => {
+          if (state.stickToBottom) {
+            scrollStreamToBottomIfSticky(false);
+          }
+        },
+        { once: true }
+      );
+    }
   });
 
   container.querySelectorAll(".open-subagent-stream-btn").forEach((btn) => {
@@ -3777,6 +3815,7 @@ function setupEventListeners() {
   streamPane?.addEventListener(
     "scroll",
     () => {
+      if (Date.now() < programmaticScrollUntil) return;
       state.stickToBottom = isStreamNearBottom(streamPane);
       updateJumpToBottomButton();
     },
@@ -3875,7 +3914,11 @@ function setupEventListeners() {
       tabBtn.classList.add("active");
       document.querySelectorAll(".tab-pane").forEach((p) => p.classList.remove("active"));
       document.getElementById(`tab-${tab}`)?.classList.add("active");
-      updateJumpToBottomButton();
+      if (tab === "stream" && state.stickToBottom) {
+        scrollStreamToBottomIfSticky(true);
+      } else {
+        updateJumpToBottomButton();
+      }
       if (tab === "reviews" && state.activeSessionId) {
         loadSessionDiff(state.activeSessionId);
       }
