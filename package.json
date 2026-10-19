@@ -1,0 +1,32 @@
+{
+  "name": "remote-agent",
+  "version": "1.0.0",
+  "description": "Mobile companion & LAN/WAN bridge for Desktop GitHub Copilot sessions, MCP servers, 3D/image artifacts, and interactive steering.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "node --no-warnings --import tsx src/server.ts",
+    "start": "node --no-warnings --import tsx src/server.ts",
+    "start:wan": "node --no-warnings --import tsx src/server.ts --wan",
+    "setup": "node scripts/setup-wizard.mjs",
+    "join": "node scripts/setup-wizard.mjs --join",
+    "build": "tsc && node scripts/build-android-apk.mjs && node scripts/build-desktop-app.mjs",
+    "build:apk": "node scripts/build-android-apk.mjs",
+    "build:desktop": "node scripts/build-desktop-app.mjs",
+    "test": "node --no-warnings --import tsx --test test/server.test.ts"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

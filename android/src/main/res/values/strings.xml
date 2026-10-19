@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Copilot Remote</string>
+    <string name="default_lan_url"></string>
+    <string name="default_wan_url"></string>
+    <string name="default_token"></string>
+</resources>

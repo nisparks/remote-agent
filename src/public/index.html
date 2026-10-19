@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f19" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Copilot Remote Agent</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Navigation Bar (Unified on Mobile Portrait) -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="mobileMenuBtn" class="btn btn-icon" title="Toggle Sessions Drawer" aria-label="Menu">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <img src="/icon.svg" alt="Remote Agent" class="brand-icon desktop-only-flex" />
+        <div class="topbar-title-group" id="topbarTitleTapArea" style="cursor: pointer;" title="Tap to switch sessions">
+          <div class="topbar-title">
+            <span id="topbarPrimaryTitle">Copilot Remote</span>
+            <span id="topbarSessionBadge" class="badge badge-idle">IDLE</span>
+            <span id="protoBadge" class="proto-pill" style="display: none;">HTTPS</span>
+          </div>
+          <div class="topbar-subtitle">
+            <span id="hostStatusDot" class="status-dot"></span>
+            <span id="hostStatusText">Connecting...</span>
+          </div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <select id="sessionModeSelect" class="mode-select" title="Session Execution Mode">
+          <option value="interactive">Interactive</option>
+          <option value="plan">Plan</option>
+          <option value="autopilot">Autopilot</option>
+        </select>
+        <button id="abortSessionBtn" class="btn btn-sm btn-danger" style="display: none;" title="Stop Current Turn">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>
+        </button>
+        <button id="nativeHubBtn" class="btn btn-sm btn-icon" style="display: none;" title="Connection Hub (LAN / WAN)">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <button id="openQrBtn" class="btn btn-sm btn-icon" title="Pair Android Phone, Download APK &amp; WAN Settings">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </button>
+        <button id="refreshBtn" class="btn btn-sm btn-icon" title="Reload UI" aria-label="Reload UI">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="workspace-body">
+      <!-- Left Sidebar / Mobile Drawer: Multi-Desktop Switcher, Sessions & Desktop MCPs -->
+      <aside id="sessionsPanel" class="sessions-panel">
+        <div class="panel-header">
+          <div id="hostSwitcherStrip" class="host-switcher-strip"></div>
+          <div id="quotaDrawerCard" class="quota-drawer-card" style="display: none;"></div>
+          <input id="sessionSearchInput" type="search" class="search-input" placeholder="Search sessions, repos, @accounts..." />
+          <div id="mcpStrip" class="mcp-strip" title="Active Desktop MCP Servers"></div>
+        </div>
+        <div id="sessionsList" class="sessions-list"></div>
+      </aside>
+
+      <!-- Main Session Detail Panel -->
+      <main class="main-panel">
+        <!-- View Tabs (4-Column Full-Width Segmented Control) -->
+        <nav class="view-tabs">
+          <button class="view-tab active" data-tab="stream">
+            <span>Stream</span> <span id="streamTabCount" class="tab-count">0</span>
+          </button>
+          <button class="view-tab" data-tab="artifacts">
+            <span>Artifacts</span> <span id="artifactsTabCount" class="tab-count">0</span>
+          </button>
+          <button class="view-tab" data-tab="reviews">
+            <span>Review</span> <span id="reviewsTabCount" class="tab-count">0</span>
+          </button>
+          <button class="view-tab" data-tab="todos">
+            <span>Plan &amp; Quota</span> <span id="todosTabCount" class="tab-count">0</span>
+          </button>
+        </nav>
+
+        <!-- Tab 1: Live Conversation & Tool Stream -->
+        <section id="tab-stream" class="tab-pane active">
+          <div id="turnsContainer" style="display: flex; flex-direction: column; gap: 12px;"></div>
+        </section>
+
+        <!-- Tab 2: Artifacts, Images & 3D STL Gallery -->
+        <section id="tab-artifacts" class="tab-pane">
+          <div class="filter-bar">
+            <button class="filter-chip active" data-filter="all">All</button>
+            <button class="filter-chip" data-filter="image">Images</button>
+            <button class="filter-chip" data-filter="3d">3D / CAD</button>
+            <button class="filter-chip" data-filter="document">Docs</button>
+            <button class="filter-chip" data-filter="data">Code &amp; Data</button>
+          </div>
+          <div id="artifactsGrid" class="artifacts-grid"></div>
+        </section>
+
+        <!-- Tab 3: Git Diff & Mobile Review Comment Queue -->
+        <section id="tab-reviews" class="tab-pane">
+          <div class="review-queue-box">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+              <div>
+                <strong style="font-size: 13px; color: var(--text-primary);">Review comment queue</strong>
+                <div style="font-size: 12px; color: var(--text-secondary);">
+                  Queue notes on renders, 3D meshes, or diff lines and dispatch them as a single turn.
+                </div>
+              </div>
+              <div style="display: flex; gap: 6px;">
+                <button id="addGeneralReviewBtn" class="btn btn-sm">Add note</button>
+                <button id="dispatchReviewsBtn" class="btn btn-sm btn-primary">Send batch</button>
+              </div>
+            </div>
+            <div id="reviewQueueList" style="display: flex; flex-direction: column; gap: 8px;"></div>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px;">
+            <strong style="font-size: 13px; color: var(--text-primary);">Workspace changes</strong>
+            <button id="refreshDiffBtn" class="btn btn-sm">Refresh</button>
+          </div>
+          <div id="diffContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+        </section>
+
+        <!-- Tab 4: Copilot Monthly Quota, Session Plan / Todos & Desktop MCP Status -->
+        <section id="tab-todos" class="tab-pane">
+          <div id="quotaDetailsContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+          <div id="todosContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+          <div id="mcpDetailsContainer" style="display: flex; flex-direction: column; gap: 10px; margin-top: 12px;"></div>
+        </section>
+
+        <!-- Action Required Banner (ask_user / Plan Approval) -->
+        <div id="actionBanner" class="action-banner" style="display: none;"></div>
+
+        <!-- Floating Jump-to-Bottom Pill when user scrolls up -->
+        <button id="jumpToBottomBtn" class="jump-bottom-btn" style="display: none;" title="Jump to bottom and resume auto-scroll">
+          ↓ Jump to latest
+        </button>
+
+        <!-- Bottom Steering Composer (Native Unified Card) -->
+        <div class="composer-bar">
+          <div id="workspaceStatusBar" class="workspace-status-pills"></div>
+          <div id="stagedAttachments" class="attachment-staging" style="display: none;"></div>
+          <div class="composer-box">
+            <textarea
+              id="promptInput"
+              class="composer-textarea"
+              rows="1"
+              placeholder="Delegate a task or steer this session..."
+            ></textarea>
+            <div class="composer-toolbar">
+              <div class="composer-toolbar-left" style="flex-wrap: wrap; gap: 6px;">
+                <label class="composer-icon-btn" title="Attach image or file">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                  <input id="fileUploadInput" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.md,.json,.txt" multiple style="display: none;" />
+                </label>
+                <select id="sessionModelSelect" class="composer-meta-select" title="Select AI Model">
+                  <option value="auto">Auto</option>
+                  <option value="gemini-4-argon">Gemini 4 Argon</option>
+                  <option value="claude-opus-5.5">Claude Opus 5.5</option>
+                  <option value="claude-sonnet-5.5">Claude Sonnet 5.5</option>
+                  <option value="gpt-6.1-sol">GPT-6.1 Sol</option>
+                  <option value="gpt-6-astra">GPT-6 Astra</option>
+                </select>
+                <select id="sessionEffortSelect" class="composer-meta-select" title="Reasoning Effort">
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high" selected>High</option>
+                  <option value="xhigh">XHigh</option>
+                  <option value="max">Max</option>
+                </select>
+                <select id="sessionContextTierSelect" class="composer-meta-select" title="Context Window Tier">
+                  <option value="default">Standard Ctx</option>
+                  <option value="long_context">1M Long Ctx</option>
+                </select>
+                <select id="deliveryModeSelect" class="composer-meta-select" title="Message delivery mode">
+                  <option value="immediate">Steer now</option>
+                  <option value="enqueue">Queue next</option>
+                </select>
+                <span id="contextMeterText" class="composer-context-text"></span>
+              </div>
+              <button id="sendPromptBtn" class="composer-send-btn" title="Send message (Enter)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Global Floating Login Approval Banner (z-index: 9999 so it appears even over Settings/QR or Image modals!) -->
+  <div id="loginApprovalBanner" class="action-banner" style="display: none; position: fixed; top: calc(12px + var(--safe-top)); left: 12px; right: 12px; z-index: 9999; margin: 0; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.75); border-color: #58a6ff; background: #161b22;"></div>
+
+  <!-- Modal 1: Image Lightbox (Pinch-to-Zoom & Pan + Optional Touch Markup Studio) -->
+  <div id="imageModal" class="modal-backdrop">
+    <div class="modal-header" style="flex-wrap: wrap; gap: 8px;">
+      <div style="min-width: 120px; flex: 1;">
+        <div id="imageModalTitle" style="font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Image Artifact</div>
+        <div id="imageModalHint" style="font-size: 11px; color: var(--text-secondary);">Pinch to zoom • Drag to pan • Double-tap 2×</div>
+      </div>
+      <div style="display: flex; gap: 5px; flex-wrap: wrap; align-items: center; justify-content: flex-end;">
+        <button id="zoomFitBtn" class="btn btn-sm" title="Fit whole image on screen">Fit</button>
+        <button id="zoomFillWidthBtn" class="btn btn-sm" title="Snap to 100% of screen width">100% W</button>
+        <button id="zoom2xBtn" class="btn btn-sm" title="Zoom to 200%">2×</button>
+        <span id="resetImageZoomBtn" style="font-size: 11px; color: var(--text-secondary); min-width: 38px; text-align: center; font-variant-numeric: tabular-nums;">100%</span>
+        <button id="toggleDrawModeBtn" class="btn btn-sm btn-purple" title="Toggle between Zoom/Pan and Draw Markup">Annotate</button>
+        <button id="undoMarkupBtn" class="btn btn-sm" style="display: none;" title="Undo last stroke">Undo</button>
+        <button id="clearMarkupBtn" class="btn btn-sm" style="display: none;" title="Clear all markup">Clear</button>
+        <a id="downloadImageLink" class="btn btn-sm" download target="_blank" style="text-decoration: none;" title="Download original">⬇</a>
+        <button id="closeImageModalBtn" class="btn btn-sm" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="imageModalViewport" class="modal-body" style="overflow: hidden; touch-action: none;">
+      <div class="annotation-canvas-wrap">
+        <canvas id="annotationCanvas" style="transform-origin: center center; will-change: transform;"></canvas>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <input
+        id="imageCommentInput"
+        type="text"
+        class="search-input"
+        style="flex: 1; min-width: 160px;"
+        placeholder="Add comment on this image (optional markup)..."
+      />
+      <button id="queueImageReviewBtn" class="btn btn-sm">+ Queue</button>
+      <button id="sendImageNowBtn" class="btn btn-sm btn-primary">Send ➤</button>
+    </div>
+  </div>
+
+  <!-- Modal 2: Interactive 3D STL Mesh Viewer -->
+  <div id="stlModal" class="modal-backdrop">
+    <div class="modal-header">
+      <div>
+        <div id="stlModalTitle" style="font-weight: 700;">3D STL Mesh Viewer</div>
+        <div id="stlModalStats" style="font-size: 11px; color: var(--text-secondary);">1-finger drag: Orbit • 2-finger pinch/drag: Zoom &amp; Pan</div>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <button id="stlResetCamBtn" class="btn btn-sm">Reset View</button>
+        <button id="stlWireframeBtn" class="btn btn-sm">Wireframe</button>
+        <button id="stlSnapshotAnnotateBtn" class="btn btn-sm btn-purple">✏️ Annotate 3D View</button>
+        <button id="closeStlModalBtn" class="btn btn-sm">✕ Close</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <canvas id="stlCanvas" width="800" height="600"></canvas>
+    </div>
+  </div>
+
+  <!-- Modal 3: Text / Markdown / JSON Artifact Viewer -->
+  <div id="docModal" class="modal-backdrop">
+    <div class="modal-header">
+      <div id="docModalTitle" style="font-weight: 700;">Artifact Preview</div>
+      <div style="display: flex; gap: 6px;">
+        <button id="commentOnDocBtn" class="btn btn-sm btn-primary">💬 Add Review Comment</button>
+        <button id="closeDocModalBtn" class="btn btn-sm">✕ Close</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div id="docModalContent" class="doc-viewer-content"></div>
+    </div>
+  </div>
+
+  <!-- Modal 4: QR Code Pairing, Rolling MFA, Temporary Machine Lease & WAN Access Modal -->
+  <div id="qrModal" class="modal-backdrop">
+    <div class="modal-header">
+      <div style="font-weight: 600;">Security, Rolling MFA &amp; Multi-Machine Pairing</div>
+      <button id="closeQrModalBtn" class="btn btn-sm">✕ Close</button>
+    </div>
+    <div class="modal-body" style="overflow-y: auto; justify-content: flex-start; padding-top: 16px;">
+      <div class="qr-card" style="max-width: 540px;">
+        <!-- Live Rolling 6-Digit MFA Generator (Shown on already-paired phone/desktop) -->
+        <div id="mfaGeneratorCard" style="width: 100%; display: none; background: var(--bg-secondary); border: 1px solid var(--border-strong); border-radius: 10px; padding: 12px; text-align: left; flex-direction: column; gap: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <div>
+              <div style="font-weight: 600; font-size: 13px; color: var(--text-primary);">Rolling 6-Digit MFA Code</div>
+              <div style="font-size: 11.5px; color: var(--text-secondary);">Enter this code on any other desktop/laptop to pair it temporarily</div>
+            </div>
+            <div style="text-align: right;">
+              <div id="mfaLiveCodeText" style="font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 22px; font-weight: 700; letter-spacing: 0.12em; color: #58a6ff;">--- ---</div>
+              <div id="mfaCountdownText" style="font-size: 11px; color: var(--text-secondary);">Refreshes in --s</div>
+            </div>
+          </div>
+          <div style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center;">
+            <a id="addToAuthenticatorLink" href="#" class="btn btn-sm" style="text-decoration: none;">+ Add to Authenticator App</a>
+            <button id="toggleTotpQrBtn" class="btn btn-sm">Show Authenticator QR</button>
+          </div>
+          <div id="totpQrWrap" style="display: none; text-align: center; padding-top: 6px;">
+            <img id="totpQrImg" src="" alt="Authenticator TOTP QR" style="width: 170px; height: 170px; border-radius: 8px; background: #fff; padding: 6px;" />
+            <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px;">Scan with Google Authenticator, Microsoft Authenticator, or 1Password</div>
+          </div>
+          <div id="tempSessionsContainer" style="display: none; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px;"></div>
+        </div>
+
+        <!-- Connect / Temporarily Pair This Machine (6-Digit MFA, Push Approval, or Token) -->
+        <div style="width: 100%; background: var(--bg-secondary); border: 1px solid var(--border-strong); border-radius: 10px; padding: 12px; text-align: left; display: flex; flex-direction: column; gap: 8px;">
+          <div style="font-weight: 600; font-size: 13px;">Pair This Machine (6-Digit MFA or 1-Tap Phone Approval)</div>
+          <div style="font-size: 11.5px; color: var(--text-secondary);">
+            Enter the 6-digit MFA code from your paired Android app or Authenticator app, or request 1-tap approval on your phone:
+          </div>
+          <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+            <input id="manualTokenInput" type="text" class="search-input" style="flex: 1; min-width: 150px;" placeholder="6-digit MFA code (e.g. 482910) or token..." />
+            <select id="tempLeaseDurationSelect" class="mode-select" title="Session Lease Duration">
+              <option value="1">1 Hour</option>
+              <option value="8" selected>8 Hours (Workday)</option>
+              <option value="24">24 Hours</option>
+              <option value="720">30 Days (Trusted)</option>
+            </select>
+            <button id="saveTokenBtn" class="btn btn-sm btn-primary">Connect</button>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+            <button id="requestPhoneApprovalBtn" class="btn btn-sm" style="width: 100%;">Request 1-Tap Approval on Paired Phone</button>
+            <div id="phoneApprovalStatusText" style="display: none; width: 100%; font-size: 12px; color: #58a6ff; text-align: center; padding: 4px 0;"></div>
+          </div>
+          <button id="openNativeEndpointHubBtn" class="btn btn-sm" style="width: 100%; margin-top: 2px; display: none;">
+            Switch Endpoint (Android Connection Hub)
+          </button>
+        </div>
+
+        <!-- WAN Tunnel & Custom Domain Controls -->
+        <div style="width: 100%; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; text-align: left; display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+            <div>
+              <div style="font-weight: 600; font-size: 13px;">1. Remote WAN Access Mode</div>
+              <div id="wanStatusLabel" style="font-size: 11.5px; color: var(--text-secondary);">Stopped (LAN only)</div>
+            </div>
+            <div style="display: flex; gap: 6px;">
+              <button id="startWanBtn" class="btn btn-sm btn-primary">Cloudflare Tunnel</button>
+              <button id="stopWanBtn" class="btn btn-sm btn-danger" style="display: none;">Stop Tunnel</button>
+            </div>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <input id="customWanUrlInput" type="text" class="search-input" placeholder="Or Custom HTTPS / DDNS URL (https://...:4321)" />
+            <button id="saveCustomWanUrlBtn" class="btn btn-sm">Save URL</button>
+          </div>
+        </div>
+
+        <!-- Multi-Machine Peer Hub Join -->
+        <div style="width: 100%; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; text-align: left; display: flex; flex-direction: column; gap: 6px;">
+          <div style="font-weight: 600; font-size: 13px;">2. Link Another Desktop or Server</div>
+          <div style="font-size: 11.5px; color: var(--text-secondary);">
+            Paste the Pairing URL from a 2nd desktop or server to link both machines bi-directionally:
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <input id="peerPairingUrlInput" type="text" class="search-input" placeholder="http://192.168.1.x:4321/?token=... or https://..." />
+            <button id="linkPeerMachineBtn" class="btn btn-sm btn-primary">Link</button>
+          </div>
+        </div>
+
+        <img id="qrCodeImg" src="" alt="Pairing QR Code" />
+        <div id="qrUrlsList" style="font-size: 12px; word-break: break-all; color: var(--accent);"></div>
+
+        <!-- Native App Installers & 1-Tap Deep-Link Auto-Pairing -->
+        <div style="width: 100%; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; border-top: 1px solid var(--border); padding-top: 12px;">
+          <a id="downloadApkBtn" href="/download/RemoteAgent-android.apk" class="btn btn-sm btn-purple" style="text-decoration: none;" download>
+            1. Download Android App (.APK)
+          </a>
+          <a id="autoPairNativeAppBtn" href="#" class="btn btn-sm btn-primary" style="text-decoration: none; display: none;">
+            2. Auto-Pair Android App (1-Tap)
+          </a>
+          <a id="downloadDesktopBtn" href="/download/RemoteAgent-Desktop-Setup.exe" class="btn btn-sm" style="text-decoration: none;" download>
+            Download Windows Setup (.EXE)
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
