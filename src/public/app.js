@@ -20,6 +20,7 @@ const state = {
   diff: null,
   streaming: null,
   pendingSteering: [],
+  revealedTimestampTurnIds: new Set(),
   sessionCache: new Map(),
   uiPrefs: (() => {
     try {
@@ -287,6 +288,42 @@ function formatTimeAgo(iso) {
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
   return `${Math.floor(diffSec / 86400)}d ago`;
+}
+
+function formatShortClockTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const isToday =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const timeStr = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (isToday) return timeStr;
+  const dateStr = d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${dateStr}, ${timeStr}`;
+}
+
+function formatFullMessageTimestamp(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const now = new Date();
+  const isToday =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  const timeStr = d.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const datePart = isToday
+    ? "Today"
+    : d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  const rel = formatTimeAgo(iso);
+  return `${datePart} at ${timeStr}${rel ? ` · ${rel}` : ""}`;
 }
 
 // --- WebSocket Live Connection & Persistent Heartbeat ---
@@ -1858,10 +1895,14 @@ function renderTurns(scrollBottom = false) {
 
     if (t.role === "user") {
       flushStepRows();
+      const turnId = String(t.id || `user-${idx}`);
+      const isShown = state.revealedTimestampTurnIds.has(turnId);
       outBlocks.push(`
-        <div class="turn-card user">
+        <div class="turn-card user ${isShown ? "show-timestamp" : ""}" data-turn-id="${escapeHtml(turnId)}" data-timestamp="${escapeHtml(t.timestamp || "")}" title="Tap or swipe left for timestamp">
           ${t.content ? `<div class="turn-content">${renderMarkdown(t.content)}</div>` : ""}
           ${inlineArtsHtml}
+          <div class="bubble-timestamp-drawer">${escapeHtml(formatFullMessageTimestamp(t.timestamp))}</div>
+          <span class="bubble-swipe-time">${escapeHtml(formatShortClockTime(t.timestamp))}</span>
         </div>
       `);
       return;
@@ -1886,14 +1927,18 @@ function renderTurns(scrollBottom = false) {
 
     if (t.content) {
       flushStepRows();
+      const turnId = String(t.id || `assistant-${idx}`);
+      const isShown = state.revealedTimestampTurnIds.has(turnId);
       outBlocks.push(`
-        <div class="turn-card assistant">
+        <div class="turn-card assistant ${isShown ? "show-timestamp" : ""}" data-turn-id="${escapeHtml(turnId)}" data-timestamp="${escapeHtml(t.timestamp || "")}" title="Tap or swipe left for full timestamp">
           <div class="turn-meta">
             <span class="turn-role">Copilot ${t.model ? `<span style="font-weight:400;color:var(--text-muted);">· ${escapeHtml(t.model)}</span>` : ""}</span>
             <span>${formatTimeAgo(t.timestamp)}</span>
           </div>
           <div class="turn-content">${renderMarkdown(t.content)}</div>
           ${inlineArtsHtml}
+          <div class="bubble-timestamp-drawer">${escapeHtml(formatFullMessageTimestamp(t.timestamp))}</div>
+          <span class="bubble-swipe-time">${escapeHtml(formatShortClockTime(t.timestamp))}</span>
         </div>
       `);
     } else if (inlineArtsHtml) {
@@ -1924,14 +1969,18 @@ function renderTurns(scrollBottom = false) {
             })
             .join("")}</div>`
         : "";
+      const pId = String(item.id || "pending");
+      const isShown = state.revealedTimestampTurnIds.has(pId);
       return `
-        <div class="turn-card user" style="border-style: dashed; border-color: var(--warning); background: rgba(210, 153, 34, 0.1);">
+        <div class="turn-card user ${isShown ? "show-timestamp" : ""}" data-turn-id="${escapeHtml(pId)}" data-timestamp="${escapeHtml(item.createdAt || "")}" style="border-style: dashed; border-color: var(--warning); background: rgba(210, 153, 34, 0.1);">
           <div class="turn-meta">
             <span class="turn-role" style="color: var(--warning);">${modeLabel}</span>
             <span>${formatTimeAgo(item.createdAt)}</span>
           </div>
           <div class="turn-content">${renderMarkdown(item.prompt)}</div>
           ${attThumbs}
+          <div class="bubble-timestamp-drawer">${escapeHtml(formatFullMessageTimestamp(item.createdAt))}</div>
+          <span class="bubble-swipe-time">${escapeHtml(formatShortClockTime(item.createdAt))}</span>
         </div>
       `;
     })
@@ -1939,6 +1988,25 @@ function renderTurns(scrollBottom = false) {
 
   container.innerHTML = html + `<div id="streamingTurnSlot"></div>` + pendingHtml;
   renderStreamingTurn();
+
+  // Tap/click on any user or assistant message bubble to toggle its exact timestamp drawer
+  container.querySelectorAll(".turn-card[data-turn-id]").forEach((card) => {
+    card.addEventListener("click", (e) => {
+      // Do not toggle if clicking a link, button, details summary, or artifact card, or selecting text
+      if (e.target.closest("a, button, summary, input, .inline-artifact-card")) return;
+      const sel = window.getSelection ? String(window.getSelection()) : "";
+      if (sel && sel.length > 0) return;
+      const turnId = card.getAttribute("data-turn-id");
+      if (!turnId) return;
+      if (state.revealedTimestampTurnIds.has(turnId)) {
+        state.revealedTimestampTurnIds.delete(turnId);
+        card.classList.remove("show-timestamp");
+      } else {
+        state.revealedTimestampTurnIds.add(turnId);
+        card.classList.add("show-timestamp");
+      }
+    });
+  });
 
   container.querySelectorAll(".inline-artifact-card").forEach((el) => {
     el.addEventListener("click", () => {
@@ -3714,6 +3782,85 @@ function setupEventListeners() {
     },
     { passive: true }
   );
+
+  // iMessage / SMS-style swipe-left gesture on #tab-stream to peek message timestamps
+  let swipeStartX = 0;
+  let swipeStartY = 0;
+  let swipeLockedHorizontal = false;
+  let swipeCancelVertical = false;
+  let swipedBubbleCard = null;
+  let lastSwipeDx = 0;
+
+  streamPane?.addEventListener(
+    "touchstart",
+    (e) => {
+      if (e.touches.length !== 1) return;
+      swipeStartX = e.touches[0].clientX;
+      swipeStartY = e.touches[0].clientY;
+      swipeLockedHorizontal = false;
+      swipeCancelVertical = false;
+      lastSwipeDx = 0;
+      swipedBubbleCard = e.target.closest?.(".turn-card[data-turn-id]") || null;
+    },
+    { passive: true }
+  );
+
+  streamPane?.addEventListener(
+    "touchmove",
+    (e) => {
+      if (e.touches.length !== 1 || swipeCancelVertical) return;
+      const dx = e.touches[0].clientX - swipeStartX;
+      const dy = e.touches[0].clientY - swipeStartY;
+
+      if (!swipeLockedHorizontal) {
+        if (Math.abs(dy) > 12 && Math.abs(dy) >= Math.abs(dx)) {
+          swipeCancelVertical = true;
+          return;
+        }
+        if (dx < -12 && Math.abs(dx) > Math.abs(dy) * 1.35) {
+          swipeLockedHorizontal = true;
+        }
+      }
+
+      if (swipeLockedHorizontal) {
+        lastSwipeDx = dx;
+        const turnsEl = document.getElementById("turnsContainer");
+        if (turnsEl) {
+          const damped = Math.max(-76, Math.min(0, dx * 0.58));
+          turnsEl.classList.add("swiping-timestamps");
+          turnsEl.style.setProperty("--swipe-x", `${Math.round(damped)}px`);
+        }
+      }
+    },
+    { passive: true }
+  );
+
+  const finishTimestampSwipe = () => {
+    const turnsEl = document.getElementById("turnsContainer");
+    if (turnsEl && turnsEl.classList.contains("swiping-timestamps")) {
+      turnsEl.classList.remove("swiping-timestamps");
+      turnsEl.style.removeProperty("--swipe-x");
+    }
+    if (swipeLockedHorizontal && lastSwipeDx < -38 && swipedBubbleCard) {
+      const turnId = swipedBubbleCard.getAttribute("data-turn-id");
+      if (turnId) {
+        if (state.revealedTimestampTurnIds.has(turnId)) {
+          state.revealedTimestampTurnIds.delete(turnId);
+          swipedBubbleCard.classList.remove("show-timestamp");
+        } else {
+          state.revealedTimestampTurnIds.add(turnId);
+          swipedBubbleCard.classList.add("show-timestamp");
+        }
+      }
+    }
+    swipeLockedHorizontal = false;
+    swipeCancelVertical = false;
+    swipedBubbleCard = null;
+    lastSwipeDx = 0;
+  };
+
+  streamPane?.addEventListener("touchend", finishTimestampSwipe, { passive: true });
+  streamPane?.addEventListener("touchcancel", finishTimestampSwipe, { passive: true });
 
   document.getElementById("jumpToBottomBtn")?.addEventListener("click", () => {
     scrollStreamToBottomIfSticky(true);

@@ -552,7 +552,12 @@ html, body {
 }
 
 /* Stream / Conversation Turns (Human-crafted Primer Chat) */
+#turnsContainer {
+  overflow-x: hidden;
+}
+
 .turn-card {
+  position: relative;
   border-radius: 12px;
   padding: 10px 14px;
   background: var(--bg-secondary);
@@ -560,6 +565,14 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.turn-card[data-turn-id] {
+  cursor: pointer;
+}
+#turnsContainer.swiping-timestamps .turn-card[data-turn-id] {
+  transition: none;
+  transform: translate3d(var(--swipe-x, 0px), 0, 0);
 }
 .turn-card.user {
   background: #21262d;
@@ -577,6 +590,59 @@ html, body {
   padding: 2px 2px;
   width: 100%;
   box-shadow: none;
+}
+
+/* SMS / iMessage-style tap-to-reveal & swipe-to-peek timestamps */
+.bubble-timestamp-drawer {
+  display: none;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  padding-top: 2px;
+  user-select: none;
+}
+.turn-card.user .bubble-timestamp-drawer {
+  text-align: right;
+  color: #8b949e;
+}
+.turn-card.assistant .bubble-timestamp-drawer {
+  text-align: left;
+  color: #8b949e;
+}
+.turn-card.show-timestamp .bubble-timestamp-drawer {
+  display: block;
+  animation: fadeInStamp 0.14s ease-out;
+}
+
+.bubble-swipe-time {
+  position: absolute;
+  right: -74px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 68px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+#turnsContainer.swiping-timestamps .bubble-swipe-time {
+  opacity: 1;
+}
+
+@keyframes fadeInStamp {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .turn-meta {
