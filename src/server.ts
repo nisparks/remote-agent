@@ -1097,6 +1097,7 @@ export class RemoteAgentServer {
             turns: details.turns,
             artifacts: details.artifacts,
             subAgents: details.subAgents,
+            detachedShells: details.detachedShells,
             todos,
             reviews,
             streaming,

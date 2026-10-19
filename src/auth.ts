@@ -75,6 +75,7 @@ const AUTH_FILE_PATH = path.join(os.homedir(), ".copilot", "remote-agent-auth.js
 
 export class AuthManager {
   private config: AuthConfig;
+  private isEphemeralTestAuth = false;
   private failedAttempts = new Map<string, { count: number; lockedUntil: number }>();
   private approvalRateLimits = new Map<string, { count: number; resetAt: number }>();
   private consumedTotpCodes = new Set<string>();
@@ -83,6 +84,7 @@ export class AuthManager {
 
   constructor(customToken?: string) {
     if (customToken) {
+      this.isEphemeralTestAuth = true;
       this.config = {
         pairingToken: customToken,
         totpSecret: toBase32(crypto.randomBytes(20)),
@@ -140,6 +142,7 @@ export class AuthManager {
   }
 
   private saveConfig(cfg = this.config): void {
+    if (this.isEphemeralTestAuth) return;
     try {
       cfg.tempSessions = [...this.tempSessions.values()];
       fs.mkdirSync(path.dirname(AUTH_FILE_PATH), { recursive: true });

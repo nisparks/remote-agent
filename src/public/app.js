@@ -12,6 +12,9 @@ const state = {
   turns: [],
   artifacts: [],
   subAgents: [],
+  detachedShells: [],
+  activeSubAgentId: null,
+  activeDetachedShellId: null,
   todos: [],
   reviews: [],
   diff: null,
@@ -474,6 +477,13 @@ function closeAnyOpenOverlay() {
     drawer.classList.remove("mobile-open");
     return true;
   }
+  if (state.activeSubAgentId || state.activeDetachedShellId) {
+    state.activeSubAgentId = null;
+    state.activeDetachedShellId = null;
+    renderAgentHierarchyBar();
+    renderTurns(false);
+    return true;
+  }
   if (state.activeTab !== "stream") {
     document.querySelector('.view-tab[data-tab="stream"]')?.click();
     return true;
@@ -725,10 +735,16 @@ async function loadSessionsList(autoSelectFirst = true) {
 }
 
 function applySessionPayload(data, scrollBottom = false) {
+  const switchedSession = state.activeSession?.id !== data.session?.id;
   state.activeSession = data.session;
   state.turns = data.turns || [];
   state.artifacts = data.artifacts || [];
   state.subAgents = data.subAgents || [];
+  state.detachedShells = data.detachedShells || [];
+  if (switchedSession) {
+    state.activeSubAgentId = null;
+    state.activeDetachedShellId = null;
+  }
   state.todos = data.todos || [];
   state.reviews = data.reviews || [];
   state.pendingSteering = data.pendingSteering || [];
@@ -743,7 +759,8 @@ function applySessionPayload(data, scrollBottom = false) {
         session: data.session,
         turns: (data.turns || []).slice(-60),
         artifacts: (data.artifacts || []).slice(0, 40),
-        subAgents: (data.subAgents || []).slice(0, 40),
+        subAgents: (data.subAgents || []).slice(0, 20),
+        detachedShells: data.detachedShells || [],
         todos: data.todos || [],
         reviews: data.reviews || [],
         pendingSteering: data.pendingSteering || [],
@@ -752,6 +769,7 @@ function applySessionPayload(data, scrollBottom = false) {
   } catch {}
 
   renderSessionHeader();
+  renderAgentHierarchyBar();
   renderTurns(scrollBottom);
   renderArtifactsGallery();
   renderReviewsQueue();
@@ -1399,6 +1417,7 @@ function formatNativeToolRow(tc) {
     const agentName = sa.name || args.name || args.agent_id || "sub-agent";
     const agentType = sa.agentType || args.agent_type || "agent";
     const desc = sa.description || args.description || tc.toolTitle || agentName;
+    const targetCallId = sa.toolCallId || tc.toolCallId || "";
     primaryLabel = `Sub-Agent [${agentName}] · ${desc}`;
     const statsParts = [agentType];
     if (sa.model) statsParts.push(sa.model);
@@ -1406,6 +1425,16 @@ function formatNativeToolRow(tc) {
     if (sa.totalTokens) statsParts.push(`${formatCompactNum(sa.totalTokens)} tok`);
     if (sa.durationMs) statsParts.push(`${Math.round(sa.durationMs / 1000)}s`);
     secondaryText = statsParts.join(" · ");
+    if (targetCallId) {
+      return `
+        <div class="native-cli-row" style="display:flex;align-items:center;gap:6px;padding:4px 6px;">
+          <span class="native-cli-icon ${iconClass}">${escapeHtml(iconText)}</span>
+          <span class="native-cli-title" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(primaryLabel)}</span>
+          <span class="native-cli-sub" style="flex-shrink:0;">${escapeHtml(secondaryText)}</span>
+          <button class="btn btn-sm open-subagent-stream-btn" data-subagent-id="${escapeHtml(targetCallId)}" style="padding:2px 7px;font-size:10.5px;color:#d2a8ff;border-color:rgba(163,113,247,0.45);">Inspect →</button>
+        </div>
+      `;
+    }
   } else if (name === "read_agent" || name === "write_agent") {
     iconClass = "mcp";
     iconText = "SUB";
@@ -1546,6 +1575,104 @@ function renderWorkspaceStatusBar() {
   });
 }
 
+function renderAgentHierarchyBar() {
+  const bar = document.getElementById("agentHierarchyBar");
+  if (!bar) return;
+  const s = state.activeSession;
+  if (!s) {
+    bar.style.display = "none";
+    bar.innerHTML = "";
+    return;
+  }
+
+  const parentSess = s.parentSessionId
+    ? state.sessions.find((x) => x.id === s.parentSessionId)
+    : null;
+  const childSessions = state.sessions.filter((x) => x.parentSessionId === s.id);
+  const subAgents = state.subAgents || [];
+  const detachedShells = state.detachedShells || [];
+
+  if (!parentSess && childSessions.length === 0 && subAgents.length === 0 && detachedShells.length === 0) {
+    bar.style.display = "none";
+    bar.innerHTML = "";
+    return;
+  }
+
+  bar.style.display = "flex";
+  const pills = [];
+
+  if (parentSess) {
+    pills.push(
+      `<button class="hierarchy-node-pill" data-jump-session="${escapeHtml(parentSess.id)}" title="Jump to Parent Coordinator Session">↖ Parent: ${escapeHtml(parentSess.title.slice(0, 22))}</button>`
+    );
+  }
+
+  const isMainActive = !state.activeSubAgentId && !state.activeDetachedShellId;
+  pills.push(
+    `<button class="hierarchy-node-pill ${isMainActive ? "active" : ""}" data-select-main="1">Main Lead (${state.turns.length})</button>`
+  );
+
+  for (const cs of childSessions) {
+    pills.push(
+      `<button class="hierarchy-node-pill ${cs.isRunning ? "running" : ""}" data-jump-session="${escapeHtml(cs.id)}" title="Jump to Child Session">↳ ${escapeHtml(cs.title.slice(0, 22))}</button>`
+    );
+  }
+
+  for (const sa of subAgents) {
+    const isSel = state.activeSubAgentId === sa.toolCallId || state.activeSubAgentId === sa.id;
+    const isRun = sa.status === "running";
+    const statusIcon = isRun ? "⚡" : sa.status === "failed" ? "✕" : "✓";
+    const stepCount = sa.totalToolCalls || (sa.turns ? sa.turns.length : 0);
+    pills.push(
+      `<button class="hierarchy-node-pill ${isSel ? "active" : ""} ${isRun ? "running" : ""}" data-select-subagent="${escapeHtml(sa.toolCallId)}" title="${escapeHtml(sa.description || sa.name)}">${statusIcon} ${escapeHtml(sa.name)}${stepCount ? ` (${stepCount})` : ""}</button>`
+    );
+  }
+
+  for (const ds of detachedShells) {
+    const isSel = state.activeDetachedShellId === ds.shellId;
+    const isRun = ds.state === "active";
+    pills.push(
+      `<button class="hierarchy-node-pill ${isSel ? "active" : ""} ${isRun ? "running" : ""}" data-select-shell="${escapeHtml(ds.shellId)}" title="Detached Background Process (PID ${ds.pid || "?"})">&gt;_ ${escapeHtml(ds.shellId)} (${ds.state})</button>`
+    );
+  }
+
+  bar.innerHTML = pills.join("");
+
+  bar.querySelector("[data-select-main]")?.addEventListener("click", () => {
+    state.activeSubAgentId = null;
+    state.activeDetachedShellId = null;
+    renderAgentHierarchyBar();
+    renderTurns(false);
+  });
+
+  bar.querySelectorAll("[data-select-subagent]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-select-subagent");
+      state.activeSubAgentId = id;
+      state.activeDetachedShellId = null;
+      renderAgentHierarchyBar();
+      renderTurns(true);
+    });
+  });
+
+  bar.querySelectorAll("[data-select-shell]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-select-shell");
+      state.activeDetachedShellId = id;
+      state.activeSubAgentId = null;
+      renderAgentHierarchyBar();
+      renderTurns(false);
+    });
+  });
+
+  bar.querySelectorAll("[data-jump-session]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-jump-session");
+      if (id) selectSession(id);
+    });
+  });
+}
+
 function renderTurns(scrollBottom = false) {
   const container = document.getElementById("turnsContainer");
   const pane = document.getElementById("tab-stream");
@@ -1556,7 +1683,51 @@ function renderTurns(scrollBottom = false) {
     state.stickToBottom = true;
   }
 
-  if (state.turns.length === 0 && !state.streaming) {
+  // Case 1: Viewing a Detached Background Shell / Process
+  if (state.activeDetachedShellId) {
+    const ds = (state.detachedShells || []).find((x) => x.shellId === state.activeDetachedShellId);
+    if (!ds) {
+      state.activeDetachedShellId = null;
+    } else {
+      container.innerHTML = `
+        <div class="turn-card" style="padding:12px 14px;background:var(--bg-secondary);border-color:rgba(163,113,247,0.45);">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <div>
+              <div style="font-size:11px;color:#d2a8ff;font-weight:600;">DETACHED BACKGROUND PROCESS</div>
+              <div style="font-size:14px;font-weight:600;">&gt;_ ${escapeHtml(ds.shellId)} ${ds.pid ? `(PID ${ds.pid})` : ""}</div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <span class="badge ${ds.state === "active" ? "badge-busy" : "badge-idle"}">${escapeHtml(ds.state.toUpperCase())}</span>
+              <button id="backToMainFromShellBtn" class="btn btn-sm">← Back to Main Agent</button>
+            </div>
+          </div>
+          ${ds.logPath ? `<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">Log: ${escapeHtml(ds.logPath)}</div>` : ""}
+          <pre class="tool-call-details" style="max-height:62dvh;margin-top:8px;">${escapeHtml(ds.logPreview || "No log output captured.")}</pre>
+        </div>
+      `;
+      document.getElementById("backToMainFromShellBtn")?.addEventListener("click", () => {
+        state.activeDetachedShellId = null;
+        renderAgentHierarchyBar();
+        renderTurns(false);
+      });
+      return;
+    }
+  }
+
+  // Case 2: Viewing a specific Sub-Agent's stream vs. Main Lead Agent stream
+  let activeSubAgent = null;
+  if (state.activeSubAgentId) {
+    activeSubAgent = (state.subAgents || []).find(
+      (a) => a.toolCallId === state.activeSubAgentId || a.id === state.activeSubAgentId
+    );
+    if (!activeSubAgent) {
+      state.activeSubAgentId = null;
+    }
+  }
+
+  const sourceTurns = activeSubAgent ? activeSubAgent.turns || [] : state.turns;
+
+  if (sourceTurns.length === 0 && !state.streaming && !activeSubAgent) {
     container.innerHTML = `
       <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
         No turns recorded yet in this session. Send a prompt below to start!
@@ -1568,14 +1739,50 @@ function renderTurns(scrollBottom = false) {
   // Find index of last user message so the active/latest turn's steps are always shown open inline,
   // while older completed multi-step batches (> 4 steps) fold cleanly unless Trace: Full is active.
   let lastUserIdx = -1;
-  for (let i = state.turns.length - 1; i >= 0; i--) {
-    if (state.turns[i].role === "user") {
+  for (let i = sourceTurns.length - 1; i >= 0; i--) {
+    if (sourceTurns[i].role === "user") {
       lastUserIdx = i;
       break;
     }
   }
 
   const outBlocks = [];
+
+  if (activeSubAgent) {
+    const sa = activeSubAgent;
+    const stats = [sa.mode === "background" ? "Background Agent" : "Sync Sub-Agent", sa.agentType];
+    if (sa.model) stats.push(sa.model);
+    if (sa.totalToolCalls) stats.push(`${sa.totalToolCalls} tools`);
+    if (sa.totalTokens) stats.push(`${formatCompactNum(sa.totalTokens)} tokens`);
+    if (sa.durationMs) stats.push(`${Math.round(sa.durationMs / 1000)}s`);
+
+    outBlocks.push(`
+      <div class="turn-card" style="padding:12px 14px;background:var(--bg-secondary);border-color:rgba(163,113,247,0.45);">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div>
+            <div style="font-size:11px;color:#d2a8ff;font-weight:600;">SUB-AGENT EXECUTION STREAM</div>
+            <div style="font-size:14px;font-weight:600;">[${escapeHtml(sa.name)}] ${escapeHtml(sa.description)}</div>
+            <div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;">${escapeHtml(stats.join(" · "))}</div>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span class="badge ${sa.status === "running" ? "badge-busy" : "badge-idle"}">${escapeHtml(sa.status.toUpperCase())}</span>
+            <button id="backToMainAgentBtn" class="btn btn-sm">← Back to Main Agent</button>
+          </div>
+        </div>
+        ${
+          sa.promptPreview
+            ? `<details style="margin-top:6px;"><summary style="cursor:pointer;font-size:11.5px;color:#58a6ff;">View Delegated Task Prompt ▾</summary><div class="tool-call-details">${escapeHtml(sa.promptPreview)}</div></details>`
+            : ""
+        }
+        ${
+          sa.resultPreview
+            ? `<details style="margin-top:4px;" open><summary style="cursor:pointer;font-size:11.5px;color:var(--success);">View Sub-Agent Final Report ▾</summary><div class="tool-call-details">${escapeHtml(sa.resultPreview)}</div></details>`
+            : ""
+        }
+      </div>
+    `);
+  }
+
   let pendingStepRows = [];
   let pendingStepCount = 0;
   let pendingStepTools = new Set();
@@ -1604,7 +1811,7 @@ function renderTurns(scrollBottom = false) {
     pendingStepIsLatest = false;
   };
 
-  state.turns.forEach((t, idx) => {
+  sourceTurns.forEach((t, idx) => {
     const isLatestTurn = idx > lastUserIdx;
     const inlineArtsHtml =
       t.artifacts && t.artifacts.length > 0
@@ -1703,6 +1910,26 @@ function renderTurns(scrollBottom = false) {
       const art = state.artifacts.find((a) => a.id === id);
       if (art) openArtifactViewer(art);
     });
+  });
+
+  container.querySelectorAll(".open-subagent-stream-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const targetId = btn.getAttribute("data-subagent-id");
+      if (targetId) {
+        state.activeSubAgentId = targetId;
+        state.activeDetachedShellId = null;
+        renderAgentHierarchyBar();
+        renderTurns(true);
+      }
+    });
+  });
+
+  document.getElementById("backToMainAgentBtn")?.addEventListener("click", () => {
+    state.activeSubAgentId = null;
+    state.activeDetachedShellId = null;
+    renderAgentHierarchyBar();
+    renderTurns(false);
   });
 
   if (scrollBottom || state.stickToBottom) {
@@ -2955,7 +3182,10 @@ function renderTodosAndMcps() {
                       <div style="font-weight:600;font-size:13px;">[${escapeHtml(sa.name)}] ${escapeHtml(sa.description)}</div>
                       <div style="font-size:11.5px;color:var(--text-secondary);">${escapeHtml(stats.join(" · "))}</div>
                     </div>
-                    <span class="badge ${badgeCls}">${escapeHtml(sa.status.toUpperCase())}</span>
+                    <div style="display:flex;gap:6px;align-items:center;">
+                      <button class="btn btn-sm inspect-subagent-from-tab-btn" data-subagent-id="${escapeHtml(sa.toolCallId)}">Open Stream →</button>
+                      <span class="badge ${badgeCls}">${escapeHtml(sa.status.toUpperCase())}</span>
+                    </div>
                   </summary>
                   <div class="tool-call-details" style="margin-top:8px;">${
                     sa.promptPreview ? `Task Prompt:\n${escapeHtml(sa.promptPreview)}\n\n` : ""
@@ -2977,6 +3207,20 @@ function renderTodosAndMcps() {
         if (targetId) {
           selectSession(targetId);
           document.querySelector('.view-tab[data-tab="stream"]')?.click();
+        }
+      });
+    });
+    subAgentsEl.querySelectorAll(".inspect-subagent-from-tab-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const targetId = btn.getAttribute("data-subagent-id");
+        if (targetId) {
+          state.activeSubAgentId = targetId;
+          state.activeDetachedShellId = null;
+          document.querySelector('.view-tab[data-tab="stream"]')?.click();
+          renderAgentHierarchyBar();
+          renderTurns(true);
         }
       });
     });

@@ -57,6 +57,16 @@ export interface SubAgentItem {
   completedAt?: string;
   promptPreview?: string;
   resultPreview?: string;
+  turns?: ConversationTurn[];
+}
+
+export interface DetachedShellItem {
+  shellId: string;
+  pid: number | null;
+  state: "active" | "stopped";
+  logPath?: string;
+  logPreview?: string;
+  startedAt?: string;
 }
 
 export interface UiPreferences {
@@ -91,6 +101,7 @@ export interface ConversationTurn {
   model?: string;
   timestamp: string;
   turnId?: string;
+  parentToolCallId?: string;
   isStreaming?: boolean;
   toolCalls: ToolCallItem[];
   artifacts: ArtifactItem[];

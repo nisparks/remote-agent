@@ -10,6 +10,7 @@ import type {
   ArtifactItem,
   ConversationTurn,
   CopilotQuotaStatus,
+  DetachedShellItem,
   GitHubAccountInfo,
   McpServerSummary,
   MobileReviewComment,
@@ -168,6 +169,7 @@ export class SessionStateStore {
         turns: ConversationTurn[];
         artifacts: ArtifactItem[];
         subAgents: SubAgentItem[];
+        detachedShells: DetachedShellItem[];
         awaitingUserInput: PendingUserInput | null;
         awaitingPlanApproval: PendingPlanApproval | null;
         awaitingPermission: PendingPermissionRequest | null;
@@ -564,6 +566,7 @@ export class SessionStateStore {
       path.resolve(COPILOT_HOME),
       path.resolve(os.homedir(), "Dev"),
       path.resolve(os.homedir(), "Repos"),
+      path.resolve(os.tmpdir()),
     ]);
 
     try {
@@ -755,12 +758,19 @@ export class SessionStateStore {
             const dbRunning = Boolean(row.is_running);
             const liveWs = liveWorkspaces?.get(id);
             const liveSession = (liveWs?.session as Record<string, unknown> | undefined) || undefined;
-            // Authoritative running status from Desktop App WebSocket or data.db, verified against live process lock
+            const hasLock = this.hasActiveLockFile(sessionFolder);
+            let recentEventsWrite = false;
+            if (hasLock) {
+              try {
+                const evStat = fs.statSync(path.join(sessionFolder, "events.jsonl"));
+                recentEventsWrite = Date.now() - evStat.mtimeMs < 90_000;
+              } catch {}
+            }
             const rawRunning =
               typeof liveSession?.isRunning === "boolean"
                 ? liveSession.isRunning
-                : dbRunning;
-            const isRunning = rawRunning && this.hasActiveLockFile(sessionFolder);
+                : dbRunning || recentEventsWrite;
+            const isRunning = rawRunning && hasLock;
 
             const repo =
               row.github_owner && row.github_repo
@@ -975,7 +985,7 @@ export class SessionStateStore {
     if (fs.existsSync(eventsPath)) {
       try {
         const stat = fs.statSync(eventsPath);
-        if (stat.size <= 16 * 1024 * 1024) {
+        if (stat.size <= 350 * 1024 * 1024) {
           const raw = fs.readFileSync(eventsPath, "utf8");
           const startedMatches = raw.match(/"subagent\.started"/g);
           const completedMatches = raw.match(/"subagent\.completed"/g);
@@ -988,6 +998,13 @@ export class SessionStateStore {
       } catch {
         // Ignore
       }
+    }
+    const dsDir = path.join(folder, "detached-shells");
+    if (fs.existsSync(dsDir)) {
+      try {
+        const leases = fs.readdirSync(dsDir).filter((f) => f.endsWith(".lease.json"));
+        subAgents += leases.length;
+      } catch {}
     }
 
     const counts = {
@@ -1079,6 +1096,7 @@ export class SessionStateStore {
     turns: ConversationTurn[];
     artifacts: ArtifactItem[];
     subAgents: SubAgentItem[];
+    detachedShells: DetachedShellItem[];
     awaitingUserInput: PendingUserInput | null;
     awaitingPlanApproval: PendingPlanApproval | null;
     awaitingPermission: PendingPermissionRequest | null;
@@ -1149,12 +1167,20 @@ export class SessionStateStore {
       if (resolved.startsWith(stateRootNorm)) {
         return false;
       }
-      // 4. If this session has a workspace/worktree cwd, only allow files inside THIS session's cwd!
+      // 4. Allow referenced screenshots/artifacts written into %TEMP% by sub-agents (e.g. headless browser verification)
+      const tempRootNorm = path.resolve(os.tmpdir()).toLowerCase() + path.sep;
+      if (
+        resolved.startsWith(tempRootNorm) &&
+        !path.basename(resolved).startsWith("copilot-tool-output-")
+      ) {
+        return true;
+      }
+      // 5. If this session has a workspace/worktree cwd, only allow files inside THIS session's cwd!
       if (sessionCwd) {
         const cwdNorm = path.resolve(sessionCwd).toLowerCase();
         return resolved === cwdNorm || resolved.startsWith(cwdNorm + path.sep);
       }
-      // 5. For general_chat sessions (no project cwd), allow ~/.copilot/chats/ artifacts referenced by this chat
+      // 6. For general_chat sessions (no project cwd), allow ~/.copilot/chats/ artifacts referenced by this chat
       const chatsRootNorm = path.resolve(COPILOT_HOME, "chats").toLowerCase() + path.sep;
       return resolved.startsWith(chatsRootNorm);
     };
@@ -1223,6 +1249,8 @@ export class SessionStateStore {
     const toolCallOwnerTurn = new Map<string, ConversationTurn>();
     const subAgentsByCallId = new Map<string, SubAgentItem>();
     const subAgentsByName = new Map<string, SubAgentItem>();
+    const parentByTurnKey = new Map<string, string>();
+    let currentTurnParentCallId: string | undefined;
     let awaitingUserInput: PendingUserInput | null = null;
     let awaitingPlanApproval: PendingPlanApproval | null = null;
     let awaitingPermission: PendingPermissionRequest | null = null;
@@ -1250,7 +1278,7 @@ export class SessionStateStore {
     if (fs.existsSync(eventsPath)) {
       try {
         const stat = fs.statSync(eventsPath);
-        const MAX_DIRECT_READ = 64 * 1024 * 1024; // 64 MB (skip binary_asset lines before JSON.parse)
+        const MAX_DIRECT_READ = 350 * 1024 * 1024; // 350 MB (we fast-skip binary_asset lines before JSON.parse)
         let lines: string[] = [];
 
         if (stat.size <= MAX_DIRECT_READ) {
@@ -1309,6 +1337,20 @@ export class SessionStateStore {
             if (ctx && typeof ctx.cwd === "string" && !sessionCwd) {
               sessionCwd = ctx.cwd;
             }
+          } else if (type === "assistant.turn_start") {
+            const pCallId = typeof data.parentToolCallId === "string" ? data.parentToolCallId : undefined;
+            currentTurnParentCallId = pCallId;
+            if (pCallId) {
+              if (data.turnId !== undefined) {
+                parentByTurnKey.set(`${data.interactionId || ""}:${data.turnId}`, pCallId);
+              }
+              const sa = subAgentsByCallId.get(pCallId);
+              if (sa) {
+                sa.status = "running";
+              }
+            }
+          } else if (type === "assistant.turn_end") {
+            currentTurnParentCallId = undefined;
           } else if (type === "user.message") {
             awaitingUserInput = null;
             const rawContent = String(data.content || "");
@@ -1346,6 +1388,13 @@ export class SessionStateStore {
               ? (data.toolRequests as Array<Record<string, unknown>>)
               : [];
 
+            const turnKey = `${data.interactionId || ""}:${data.turnId ?? ""}`;
+            const turnParentCallId =
+              (typeof data.parentToolCallId === "string" && data.parentToolCallId) ||
+              parentByTurnKey.get(turnKey) ||
+              currentTurnParentCallId ||
+              undefined;
+
             // Preserve each assistant step chronologically so thoughts, tool calls, and messages appear in exact native order
             const turn: ConversationTurn = {
               id: String(data.messageId || ev.id || crypto.randomUUID()),
@@ -1355,6 +1404,7 @@ export class SessionStateStore {
               model,
               timestamp,
               turnId: data.turnId ? String(data.turnId) : undefined,
+              parentToolCallId: turnParentCallId,
               toolCalls: [],
               artifacts: [],
             };
@@ -1464,10 +1514,27 @@ export class SessionStateStore {
             }
           } else if (type === "subagent.started") {
             const callId = String(data.toolCallId || "");
-            const sa = subAgentsByCallId.get(callId);
-            if (sa) {
+            let sa = subAgentsByCallId.get(callId);
+            if (!sa && callId) {
+              const dispName = String(data.agentDisplayName || data.agentName || callId.slice(0, 8));
+              sa = {
+                id: dispName,
+                toolCallId: callId,
+                name: dispName,
+                agentType: String(data.agentType || data.agentName || "sub-agent"),
+                displayName: dispName,
+                description: String(data.agentDescription || dispName),
+                mode: data.executionMode === "background" ? "background" : "sync",
+                status: "running",
+                model: typeof data.model === "string" ? data.model : undefined,
+                startedAt: timestamp,
+              };
+              subAgentsByCallId.set(callId, sa);
+              subAgentsByName.set(dispName, sa);
+            } else if (sa) {
               if (typeof data.agentDisplayName === "string") sa.displayName = data.agentDisplayName;
               if (typeof data.agentName === "string") sa.agentType = data.agentName;
+              if (typeof data.model === "string" && !sa.model) sa.model = data.model;
             }
           } else if (type === "subagent.completed") {
             const callId = String(data.toolCallId || "");
@@ -1492,10 +1559,40 @@ export class SessionStateStore {
           } else if (type === "tool.execution_start") {
             const callId = String(data.toolCallId || "");
             const tc = toolCallsById.get(callId);
+            const ownerTurn = toolCallOwnerTurn.get(callId);
+            if (ownerTurn && typeof data.parentToolCallId === "string" && !ownerTurn.parentToolCallId) {
+              ownerTurn.parentToolCallId = data.parentToolCallId;
+            }
             if (tc) {
               if (typeof data.mcpServerName === "string") tc.mcpServerName = data.mcpServerName;
               if (typeof data.mcpToolName === "string") tc.mcpToolName = data.mcpToolName;
               if (typeof data.toolTitle === "string" && !tc.toolTitle) tc.toolTitle = data.toolTitle;
+              const startArgs = (data.arguments as Record<string, unknown>) || {};
+              if (Object.keys(startArgs).length > 0 && (!tc.arguments || Object.keys(tc.arguments).length === 0)) {
+                tc.arguments = startArgs;
+              }
+              if (data.toolName === "task" && !tc.subAgent) {
+                const agentName = String(startArgs.name || startArgs.agent_id || callId.slice(0, 8));
+                const agentType = String(startArgs.agent_type || "task");
+                const desc = String(startArgs.description || tc.toolTitle || agentName);
+                const mode = startArgs.mode === "background" ? "background" : "sync";
+                const promptPreview = typeof startArgs.prompt === "string" ? startArgs.prompt.slice(0, 600) : undefined;
+                const sa: SubAgentItem = {
+                  id: agentName,
+                  toolCallId: callId,
+                  name: agentName,
+                  agentType,
+                  displayName: agentType,
+                  description: desc,
+                  mode,
+                  status: "running",
+                  startedAt: timestamp,
+                  promptPreview,
+                };
+                tc.subAgent = sa;
+                subAgentsByCallId.set(callId, sa);
+                subAgentsByName.set(agentName, sa);
+              }
             }
           } else if (type === "tool.execution_complete") {
             const callId = String(data.toolCallId || "");
@@ -1554,12 +1651,62 @@ export class SessionStateStore {
 
     const sessionStillRunning = this.hasActiveLockFile(folder);
     const subAgents = [...subAgentsByCallId.values()];
-    if (!sessionStillRunning) {
-      for (const sa of subAgents) {
-        if (sa.status === "running") {
-          sa.status = "completed";
-        }
+    for (const sa of subAgents) {
+      if (!sessionStillRunning && sa.status === "running") {
+        sa.status = "completed";
       }
+      const saTurns = turns.filter((t) => t.parentToolCallId === sa.toolCallId);
+      sa.turns = saTurns.slice(-180);
+      if (!sa.totalToolCalls && saTurns.length > 0) {
+        sa.totalToolCalls = saTurns.reduce((sum, t) => sum + (t.toolCalls?.length || 0), 0);
+      }
+    }
+
+    // Keep Main Lead Agent turns separate from sub-agent turns so sub-agent activity never pushes out the main conversation!
+    const mainTurns = turns.filter((t) => !t.parentToolCallId);
+
+    // Discover background detached shells in ~/.copilot/session-state/<id>/detached-shells/*.lease.json
+    const detachedShells: DetachedShellItem[] = [];
+    const dsDir = path.join(folder, "detached-shells");
+    if (fs.existsSync(dsDir)) {
+      try {
+        for (const f of fs.readdirSync(dsDir)) {
+          if (!f.endsWith(".lease.json")) continue;
+          const rawLease = JSON.parse(fs.readFileSync(path.join(dsDir, f), "utf8")) as Record<string, any>;
+          const pid = Number(rawLease.supervisor?.pid || rawLease.owner?.pid || 0) || null;
+          let alive = false;
+          if (pid && pid > 0) {
+            try {
+              process.kill(pid, 0);
+              alive = true;
+            } catch {}
+          }
+          let logPreview = "";
+          if (typeof rawLease.logPath === "string" && fs.existsSync(rawLease.logPath)) {
+            try {
+              const logStat = fs.statSync(rawLease.logPath);
+              const readLen = Math.min(8192, logStat.size);
+              if (readLen > 0) {
+                const fd = fs.openSync(rawLease.logPath, "r");
+                const buf = Buffer.allocUnsafe(readLen);
+                fs.readSync(fd, buf, 0, readLen, logStat.size - readLen);
+                fs.closeSync(fd);
+                logPreview = buf.toString("utf8");
+              }
+            } catch {}
+          }
+          detachedShells.push({
+            shellId: String(rawLease.shellId || f.replace(/\.lease\.json$/, "")),
+            pid,
+            state: alive && rawLease.state !== "stopped" ? "active" : "stopped",
+            logPath: typeof rawLease.logPath === "string" ? rawLease.logPath : undefined,
+            logPreview,
+            startedAt: rawLease.heartbeatUnixMs
+              ? new Date(Number(rawLease.heartbeatUnixMs)).toISOString()
+              : undefined,
+          });
+        }
+      } catch {}
     }
 
     const allArtifacts = [...artifactsByPath.values()].sort(
@@ -1568,9 +1715,10 @@ export class SessionStateStore {
     const artifacts = allArtifacts.slice(0, 300);
 
     const resultData = {
-      turns: turns.slice(-300),
+      turns: (mainTurns.length > 0 ? mainTurns : turns).slice(-250),
       artifacts,
       subAgents,
+      detachedShells,
       awaitingUserInput,
       awaitingPlanApproval,
       awaitingPermission,
