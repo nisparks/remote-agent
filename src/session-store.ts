@@ -159,6 +159,17 @@ export class SessionStateStore {
     string,
     { counts: RemoteSessionSummary["counts"]; cachedAt: number }
   >();
+  private eventsLineCache = new Map<
+    string,
+    {
+      birthtimeMs: number;
+      offset: number;
+      remainder: string;
+      filteredLines: string[];
+      subAgentsStarted: number;
+      subAgentsCompleted: number;
+    }
+  >();
   private sessionDetailCache = new Map<
     string,
     {
@@ -189,6 +200,104 @@ export class SessionStateStore {
       this.quickCountsCache.clear();
       this.sessionDetailCache.clear();
     }
+  }
+
+  private getFilteredEventLines(
+    sessionId: string,
+    eventsPath: string
+  ): {
+    filteredLines: string[];
+    subAgentsStarted: number;
+    subAgentsCompleted: number;
+  } {
+    const stat = fs.statSync(eventsPath);
+    const MAX_DIRECT_READ = 350 * 1024 * 1024;
+    let entry = this.eventsLineCache.get(sessionId);
+
+    if (
+      !entry ||
+      entry.birthtimeMs !== stat.birthtimeMs ||
+      stat.size < entry.offset
+    ) {
+      entry = {
+        birthtimeMs: stat.birthtimeMs,
+        offset: 0,
+        remainder: "",
+        filteredLines: [],
+        subAgentsStarted: 0,
+        subAgentsCompleted: 0,
+      };
+      this.eventsLineCache.set(sessionId, entry);
+    }
+
+    if (stat.size === entry.offset) {
+      return entry;
+    }
+
+    const ingestRawLines = (rawLines: string[]) => {
+      for (const line of rawLines) {
+        if (!line.trim()) continue;
+        if (
+          line.includes('"session.binary_asset"') ||
+          line.includes('"hook.start"') ||
+          line.includes('"hook.end"') ||
+          line.includes('"session.usage_record"') ||
+          line.includes('"session.usage_checkpoint"')
+        ) {
+          continue;
+        }
+        if (line.includes('"subagent.started"')) {
+          entry!.subAgentsStarted++;
+        } else if (line.includes('"subagent.completed"')) {
+          entry!.subAgentsCompleted++;
+        }
+        entry!.filteredLines.push(line);
+      }
+    };
+
+    const delta = stat.size - entry.offset;
+    const fd = fs.openSync(eventsPath, "r");
+    try {
+      if (entry.offset === 0 && stat.size > MAX_DIRECT_READ) {
+        const headLen = Math.min(64 * 1024, stat.size);
+        const headBuf = Buffer.allocUnsafe(headLen);
+        fs.readSync(fd, headBuf, 0, headLen, 0);
+        const headLines = headBuf.toString("utf8").split(/\r?\n/).slice(0, 5);
+
+        const tailLen = 32 * 1024 * 1024;
+        const tailBuf = Buffer.allocUnsafe(tailLen);
+        fs.readSync(fd, tailBuf, 0, tailLen, stat.size - tailLen);
+        const tailLines = tailBuf.toString("utf8").split(/\r?\n/).slice(1);
+        ingestRawLines([...headLines, ...tailLines]);
+        entry.offset = stat.size;
+        entry.remainder = "";
+      } else {
+        const CHUNK_SIZE = 16 * 1024 * 1024;
+        let pos = entry.offset;
+        let carry = entry.remainder;
+        const buf = Buffer.allocUnsafe(Math.min(CHUNK_SIZE, delta));
+        while (pos < stat.size) {
+          const toRead = Math.min(buf.length, stat.size - pos);
+          const bytesRead = fs.readSync(fd, buf, 0, toRead, pos);
+          if (bytesRead <= 0) break;
+          pos += bytesRead;
+          const text = carry + buf.toString("utf8", 0, bytesRead);
+          const parts = text.split(/\r?\n/);
+          carry = parts.pop() ?? "";
+          ingestRawLines(parts);
+        }
+        if (carry.trim() && carry.trim().endsWith("}")) {
+          ingestRawLines([carry]);
+          carry = "";
+        }
+        entry.offset = pos;
+        entry.remainder = carry;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    return entry;
   }
 
   getGitHubAccounts(): GitHubAccountInfo[] {
@@ -984,16 +1093,10 @@ export class SessionStateStore {
     const eventsPath = path.join(folder, "events.jsonl");
     if (fs.existsSync(eventsPath)) {
       try {
-        const stat = fs.statSync(eventsPath);
-        if (stat.size <= 350 * 1024 * 1024) {
-          const raw = fs.readFileSync(eventsPath, "utf8");
-          const startedMatches = raw.match(/"subagent\.started"/g);
-          const completedMatches = raw.match(/"subagent\.completed"/g);
-          subAgents = startedMatches ? startedMatches.length : 0;
-          const completedCount = completedMatches ? completedMatches.length : 0;
-          if (this.hasActiveLockFile(folder) && subAgents > completedCount) {
-            runningSubAgents = subAgents - completedCount;
-          }
+        const lineInfo = this.getFilteredEventLines(sessionId, eventsPath);
+        subAgents = lineInfo.subAgentsStarted;
+        if (this.hasActiveLockFile(folder) && subAgents > lineInfo.subAgentsCompleted) {
+          runningSubAgents = subAgents - lineInfo.subAgentsCompleted;
         }
       } catch {
         // Ignore
@@ -1248,6 +1351,7 @@ export class SessionStateStore {
     const toolCallsById = new Map<string, ToolCallItem>();
     const toolCallOwnerTurn = new Map<string, ConversationTurn>();
     const subAgentsByCallId = new Map<string, SubAgentItem>();
+    const subAgentsByAgentId = new Map<string, SubAgentItem>();
     const subAgentsByName = new Map<string, SubAgentItem>();
     const parentByTurnKey = new Map<string, string>();
     let currentTurnParentCallId: string | undefined;
@@ -1277,46 +1381,13 @@ export class SessionStateStore {
 
     if (fs.existsSync(eventsPath)) {
       try {
-        const stat = fs.statSync(eventsPath);
-        const MAX_DIRECT_READ = 350 * 1024 * 1024; // 350 MB (we fast-skip binary_asset lines before JSON.parse)
-        let lines: string[] = [];
-
-        if (stat.size <= MAX_DIRECT_READ) {
-          lines = fs.readFileSync(eventsPath, "utf8").split(/\r?\n/);
-        } else {
-          // Read head (first 64KB for session.start) + tail (last 32MB for recent conversation turns)
-          const fd = fs.openSync(eventsPath, "r");
-          try {
-            const headLen = Math.min(64 * 1024, stat.size);
-            const headBuf = Buffer.allocUnsafe(headLen);
-            fs.readSync(fd, headBuf, 0, headLen, 0);
-            const headLines = headBuf.toString("utf8").split(/\r?\n/).slice(0, 5);
-
-            const tailLen = 32 * 1024 * 1024;
-            const tailBuf = Buffer.allocUnsafe(tailLen);
-            fs.readSync(fd, tailBuf, 0, tailLen, stat.size - tailLen);
-            const tailLines = tailBuf.toString("utf8").split(/\r?\n/).slice(1);
-            lines = [...headLines, ...tailLines];
-          } finally {
-            fs.closeSync(fd);
-          }
-        }
+        const lines = this.getFilteredEventLines(sessionId, eventsPath).filteredLines;
 
         for (const line of lines) {
-          if (!line.trim()) continue;
-          // Fast skip bulky non-conversation lines (such as multi-MB session.binary_asset records) before JSON.parse
-          if (
-            line.includes('"session.binary_asset"') ||
-            line.includes('"hook.start"') ||
-            line.includes('"hook.end"') ||
-            line.includes('"session.usage_record"') ||
-            line.includes('"session.usage_checkpoint"')
-          ) {
-            continue;
-          }
           let ev: {
             id?: string;
             type?: string;
+            agentId?: string;
             timestamp?: string;
             data?: Record<string, unknown>;
           };
@@ -1327,6 +1398,7 @@ export class SessionStateStore {
           }
 
           const type = ev.type || "";
+          const evAgentId = typeof ev.agentId === "string" ? ev.agentId : undefined;
           const data = ev.data || {};
           const timestamp = ev.timestamp || new Date().toISOString();
 
@@ -1338,13 +1410,15 @@ export class SessionStateStore {
               sessionCwd = ctx.cwd;
             }
           } else if (type === "assistant.turn_start") {
-            const pCallId = typeof data.parentToolCallId === "string" ? data.parentToolCallId : undefined;
+            const pCallId =
+              (typeof data.parentToolCallId === "string" && data.parentToolCallId) ||
+              (evAgentId ? subAgentsByAgentId.get(evAgentId)?.toolCallId || evAgentId : undefined);
             currentTurnParentCallId = pCallId;
             if (pCallId) {
               if (data.turnId !== undefined) {
                 parentByTurnKey.set(`${data.interactionId || ""}:${data.turnId}`, pCallId);
               }
-              const sa = subAgentsByCallId.get(pCallId);
+              const sa = subAgentsByCallId.get(pCallId) || (evAgentId ? subAgentsByAgentId.get(evAgentId) : undefined);
               if (sa) {
                 sa.status = "running";
               }
@@ -1370,6 +1444,9 @@ export class SessionStateStore {
             if (!cleanContent && refs.length === 0) {
               continue;
             }
+            const userParentCallId =
+              (typeof data.parentToolCallId === "string" && data.parentToolCallId) ||
+              (evAgentId ? subAgentsByAgentId.get(evAgentId)?.toolCallId || evAgentId : undefined);
             turns.push({
               id: String(data.messageId || ev.id || crypto.randomUUID()),
               role: "user",
@@ -1377,6 +1454,7 @@ export class SessionStateStore {
               rawContent: rawContent !== cleanContent ? rawContent : undefined,
               timestamp,
               turnId: data.turnId ? String(data.turnId) : undefined,
+              parentToolCallId: userParentCallId,
               toolCalls: [],
               artifacts: refs,
             });
@@ -1391,6 +1469,7 @@ export class SessionStateStore {
             const turnKey = `${data.interactionId || ""}:${data.turnId ?? ""}`;
             const turnParentCallId =
               (typeof data.parentToolCallId === "string" && data.parentToolCallId) ||
+              (evAgentId ? subAgentsByAgentId.get(evAgentId)?.toolCallId || evAgentId : undefined) ||
               parentByTurnKey.get(turnKey) ||
               currentTurnParentCallId ||
               undefined;
@@ -1470,6 +1549,14 @@ export class SessionStateStore {
                 tc.subAgent = sa;
                 subAgentsByCallId.set(callId, sa);
                 subAgentsByName.set(agentName, sa);
+              } else if (toolName === "read_agent" || toolName === "write_agent") {
+                const targetId = String(
+                  args.agent_id || (Array.isArray(args.agent_ids) ? args.agent_ids[0] : "") || ""
+                );
+                const targetSa = subAgentsByAgentId.get(targetId) || subAgentsByName.get(targetId);
+                if (targetSa) {
+                  tc.subAgent = targetSa;
+                }
               }
 
               if (toolName === "ask_user") {
@@ -1519,6 +1606,7 @@ export class SessionStateStore {
               const dispName = String(data.agentDisplayName || data.agentName || callId.slice(0, 8));
               sa = {
                 id: dispName,
+                agentId: evAgentId,
                 toolCallId: callId,
                 name: dispName,
                 agentType: String(data.agentType || data.agentName || "sub-agent"),
@@ -1536,9 +1624,15 @@ export class SessionStateStore {
               if (typeof data.agentName === "string") sa.agentType = data.agentName;
               if (typeof data.model === "string" && !sa.model) sa.model = data.model;
             }
+            if (sa && evAgentId) {
+              sa.agentId = evAgentId;
+              subAgentsByAgentId.set(evAgentId, sa);
+              subAgentsByName.set(evAgentId, sa);
+            }
           } else if (type === "subagent.completed") {
             const callId = String(data.toolCallId || "");
-            const sa = subAgentsByCallId.get(callId);
+            const sa =
+              subAgentsByCallId.get(callId) || (evAgentId ? subAgentsByAgentId.get(evAgentId) : undefined);
             if (sa) {
               sa.status = "completed";
               sa.completedAt = timestamp;
@@ -1550,7 +1644,7 @@ export class SessionStateStore {
           } else if (type === "system.notification") {
             const kind = (data.kind as Record<string, unknown>) || {};
             if (kind.type === "agent_completed" && typeof kind.agentId === "string") {
-              const sa = subAgentsByName.get(kind.agentId);
+              const sa = subAgentsByAgentId.get(kind.agentId) || subAgentsByName.get(kind.agentId);
               if (sa) {
                 sa.status = kind.status === "failed" ? "failed" : "completed";
                 sa.completedAt = timestamp;
@@ -1560,8 +1654,11 @@ export class SessionStateStore {
             const callId = String(data.toolCallId || "");
             const tc = toolCallsById.get(callId);
             const ownerTurn = toolCallOwnerTurn.get(callId);
-            if (ownerTurn && typeof data.parentToolCallId === "string" && !ownerTurn.parentToolCallId) {
-              ownerTurn.parentToolCallId = data.parentToolCallId;
+            if (ownerTurn && !ownerTurn.parentToolCallId) {
+              const resolvedParent =
+                (typeof data.parentToolCallId === "string" && data.parentToolCallId) ||
+                (evAgentId ? subAgentsByAgentId.get(evAgentId)?.toolCallId || evAgentId : undefined);
+              if (resolvedParent) ownerTurn.parentToolCallId = resolvedParent;
             }
             if (tc) {
               if (typeof data.mcpServerName === "string") tc.mcpServerName = data.mcpServerName;
@@ -1592,6 +1689,12 @@ export class SessionStateStore {
                 tc.subAgent = sa;
                 subAgentsByCallId.set(callId, sa);
                 subAgentsByName.set(agentName, sa);
+              } else if ((data.toolName === "read_agent" || data.toolName === "write_agent") && !tc.subAgent) {
+                const targetId = String(
+                  startArgs.agent_id || (Array.isArray(startArgs.agent_ids) ? startArgs.agent_ids[0] : "") || ""
+                );
+                const targetSa = subAgentsByAgentId.get(targetId) || subAgentsByName.get(targetId);
+                if (targetSa) tc.subAgent = targetSa;
               }
             }
           } else if (type === "tool.execution_complete") {
@@ -1619,19 +1722,28 @@ export class SessionStateStore {
               if (tc.toolName === "task" && tc.subAgent) {
                 const bgMatch = resultContent.match(/agent_id:\s*([a-zA-Z0-9_-]+)/i);
                 if (bgMatch) {
+                  tc.subAgent.agentId = bgMatch[1];
+                  subAgentsByAgentId.set(bgMatch[1], tc.subAgent);
                   subAgentsByName.set(bgMatch[1], tc.subAgent);
                 } else {
                   tc.subAgent.status = success ? "completed" : "failed";
                   tc.subAgent.completedAt = timestamp;
                   tc.subAgent.resultPreview = resultContent.slice(0, 800);
                 }
-              } else if (tc.toolName === "read_agent") {
-                const targetAgentId = String(tc.arguments?.agent_id || "");
-                const sa = subAgentsByName.get(targetAgentId);
-                if (sa && resultContent) {
-                  sa.resultPreview = resultContent.slice(0, 1000);
-                  sa.status = "completed";
-                  if (!sa.completedAt) sa.completedAt = timestamp;
+              } else if (tc.toolName === "read_agent" || tc.toolName === "write_agent") {
+                const targetAgentId = String(
+                  tc.arguments?.agent_id ||
+                    (Array.isArray(tc.arguments?.agent_ids) ? tc.arguments?.agent_ids[0] : "") ||
+                    ""
+                );
+                const sa = subAgentsByAgentId.get(targetAgentId) || subAgentsByName.get(targetAgentId);
+                if (sa) {
+                  tc.subAgent = sa;
+                  if (tc.toolName === "read_agent" && resultContent) {
+                    sa.resultPreview = resultContent.slice(0, 1000);
+                    sa.status = "completed";
+                    if (!sa.completedAt) sa.completedAt = timestamp;
+                  }
                 }
               }
 
@@ -1650,17 +1762,23 @@ export class SessionStateStore {
     }
 
     const sessionStillRunning = this.hasActiveLockFile(folder);
-    const subAgents = [...subAgentsByCallId.values()];
-    for (const sa of subAgents) {
+    const subAgents = [...subAgentsByCallId.values()].map((sa) => {
       if (!sessionStillRunning && sa.status === "running") {
         sa.status = "completed";
       }
-      const saTurns = turns.filter((t) => t.parentToolCallId === sa.toolCallId);
-      sa.turns = saTurns.slice(-180);
+      const saTurns = turns.filter(
+        (t) =>
+          t.parentToolCallId === sa.toolCallId ||
+          (sa.agentId && t.parentToolCallId === sa.agentId)
+      );
       if (!sa.totalToolCalls && saTurns.length > 0) {
         sa.totalToolCalls = saTurns.reduce((sum, t) => sum + (t.toolCalls?.length || 0), 0);
       }
-    }
+      return {
+        ...sa,
+        turns: saTurns.slice(-180),
+      };
+    });
 
     // Keep Main Lead Agent turns separate from sub-agent turns so sub-agent activity never pushes out the main conversation!
     const mainTurns = turns.filter((t) => !t.parentToolCallId);

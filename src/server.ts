@@ -46,7 +46,13 @@ export class RemoteAgentServer {
   private clients = new Set<WsClient>();
   private pendingSteering = new Map<
     string,
-    Array<{ id: string; prompt: string; deliveryMode: DeliveryMode; createdAt: string }>
+    Array<{
+      id: string;
+      prompt: string;
+      deliveryMode: DeliveryMode;
+      attachments?: Array<{ name: string; url: string }>;
+      createdAt: string;
+    }>
   >();
   private resolvedRequestIds = new Set<string>();
   private stateWatcher: fs.FSWatcher | null = null;
@@ -1181,6 +1187,7 @@ export class RemoteAgentServer {
           }
 
           const attachmentPaths: string[] = [...(body.attachmentPaths || [])];
+          const savedAttachments: Array<{ name: string; url: string }> = [];
           if (Array.isArray(body.attachments)) {
             for (const att of body.attachments) {
               if (att.dataBase64) {
@@ -1190,6 +1197,10 @@ export class RemoteAgentServer {
                   att.dataBase64
                 );
                 attachmentPaths.push(saved);
+                savedAttachments.push({
+                  name: att.name || path.basename(saved),
+                  url: `/api/sessions/${encodeURIComponent(sessionId)}/artifact?path=${encodeURIComponent(saved)}`,
+                });
               }
             }
           }
@@ -1198,6 +1209,7 @@ export class RemoteAgentServer {
             id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             prompt,
             deliveryMode: (body.deliveryMode || "immediate") as DeliveryMode,
+            attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
             createdAt: new Date().toISOString(),
           };
           const existingQueue = this.pendingSteering.get(sessionId) || [];

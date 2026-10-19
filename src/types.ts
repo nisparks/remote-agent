@@ -42,6 +42,7 @@ export interface PendingPermissionRequest {
 
 export interface SubAgentItem {
   id: string;
+  agentId?: string;
   toolCallId: string;
   name: string;
   agentType: string;

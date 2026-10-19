@@ -1410,6 +1410,38 @@ function formatNativeToolRow(tc) {
     iconText = b.txt;
     primaryLabel = `${name === "create" ? "Create" : "Edit"} ${baseName(args.path)}`;
     secondaryText = toRelativePath(args.path);
+  } else if (name === "read_agent" || name === "write_agent") {
+    iconClass = "mcp";
+    iconText = "SUB";
+    const rawTargetId = String(
+      args.agent_id || (Array.isArray(args.agent_ids) ? args.agent_ids[0] : "agent")
+    );
+    const matchedSa =
+      tc.subAgent ||
+      (state.subAgents || []).find(
+        (a) =>
+          a.agentId === rawTargetId ||
+          a.id === rawTargetId ||
+          a.name === rawTargetId ||
+          a.toolCallId === rawTargetId
+      );
+    const displayTarget = matchedSa ? matchedSa.name : rawTargetId;
+    const targetCallId = matchedSa ? matchedSa.toolCallId : "";
+    primaryLabel = `${name === "read_agent" ? "Read sub-agent" : "Message sub-agent"} [${displayTarget}]`;
+    secondaryText =
+      name === "write_agent" && typeof args.message === "string"
+        ? args.message.replace(/\s+/g, " ").trim().slice(0, 90)
+        : tc.intentionSummary || "";
+    if (targetCallId) {
+      return `
+        <div class="native-cli-row" style="display:flex;align-items:center;gap:6px;padding:4px 6px;">
+          <span class="native-cli-icon ${iconClass}">${escapeHtml(iconText)}</span>
+          <span class="native-cli-title" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(primaryLabel)}</span>
+          <span class="native-cli-sub" style="flex-shrink:0;">${escapeHtml(secondaryText)}</span>
+          <button class="btn btn-sm open-subagent-stream-btn" data-subagent-id="${escapeHtml(targetCallId)}" style="padding:2px 7px;font-size:10.5px;color:#d2a8ff;border-color:rgba(163,113,247,0.45);">Inspect →</button>
+        </div>
+      `;
+    }
   } else if (name === "task" || tc.subAgent) {
     const sa = tc.subAgent || {};
     iconClass = "mcp";
@@ -1435,12 +1467,6 @@ function formatNativeToolRow(tc) {
         </div>
       `;
     }
-  } else if (name === "read_agent" || name === "write_agent") {
-    iconClass = "mcp";
-    iconText = "SUB";
-    const targetId = args.agent_id || (Array.isArray(args.agent_ids) ? args.agent_ids.join(",") : "agent");
-    primaryLabel = `${name === "read_agent" ? "Read sub-agent" : "Message sub-agent"} [${targetId}]`;
-    secondaryText = tc.intentionSummary || "";
   } else if (name === "grep" || name === "glob") {
     iconClass = "ts";
     iconText = "FIND";
@@ -1638,9 +1664,16 @@ function renderAgentHierarchyBar() {
 
   bar.innerHTML = pills.join("");
 
+  const ensureStreamTabActive = () => {
+    if (state.activeTab !== "stream") {
+      document.querySelector('.view-tab[data-tab="stream"]')?.click();
+    }
+  };
+
   bar.querySelector("[data-select-main]")?.addEventListener("click", () => {
     state.activeSubAgentId = null;
     state.activeDetachedShellId = null;
+    ensureStreamTabActive();
     renderAgentHierarchyBar();
     renderTurns(false);
   });
@@ -1650,6 +1683,7 @@ function renderAgentHierarchyBar() {
       const id = btn.getAttribute("data-select-subagent");
       state.activeSubAgentId = id;
       state.activeDetachedShellId = null;
+      ensureStreamTabActive();
       renderAgentHierarchyBar();
       renderTurns(true);
     });
@@ -1660,6 +1694,7 @@ function renderAgentHierarchyBar() {
       const id = btn.getAttribute("data-select-shell");
       state.activeDetachedShellId = id;
       state.activeSubAgentId = null;
+      ensureStreamTabActive();
       renderAgentHierarchyBar();
       renderTurns(false);
     });
@@ -1879,13 +1914,14 @@ function renderTurns(scrollBottom = false) {
           : "Steering · admits at next step";
       const attThumbs = Array.isArray(item.attachments) && item.attachments.length > 0
         ? `<div class="inline-artifacts">${item.attachments
-            .map(
-              (a) => `
+            .map((a) => {
+              const srcUrl = a.dataBase64 || (a.url ? withTokenUrl(a.url) : "");
+              return `
               <div class="inline-artifact-card">
-                <img class="inline-artifact-thumb" src="${escapeHtml(a.dataBase64)}" alt="${escapeHtml(a.name)}" />
+                ${srcUrl ? `<img class="inline-artifact-thumb" src="${escapeHtml(srcUrl)}" alt="${escapeHtml(a.name)}" />` : ""}
                 <div class="inline-artifact-label">${escapeHtml(a.name)}</div>
-              </div>`
-            )
+              </div>`;
+            })
             .join("")}</div>`
         : "";
       return `

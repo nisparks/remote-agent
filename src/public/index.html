@@ -95,9 +95,11 @@
           </button>
         </nav>
 
-        <!-- Tab 1: Live Conversation & Tool Stream (with Sub-Agent & Background Job Hierarchy Bar) -->
+        <!-- Sub-Agent & Background Job Hierarchy Bar (flex-shrink: 0 outside scroll pane so pills never squish) -->
+        <div id="agentHierarchyBar" class="agent-hierarchy-bar" style="display: none;"></div>
+
+        <!-- Tab 1: Live Conversation & Tool Stream -->
         <section id="tab-stream" class="tab-pane active">
-          <div id="agentHierarchyBar" class="agent-hierarchy-bar" style="display: none;"></div>
           <div id="turnsContainer" style="display: flex; flex-direction: column; gap: 12px;"></div>
         </section>
 
