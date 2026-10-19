@@ -11,12 +11,32 @@ const state = {
   activeSession: null,
   turns: [],
   artifacts: [],
+  subAgents: [],
   todos: [],
   reviews: [],
   diff: null,
   streaming: null,
   pendingSteering: [],
   sessionCache: new Map(),
+  uiPrefs: (() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("ra_ui_prefs_v1") || "null");
+      if (saved && typeof saved === "object") {
+        return {
+          pinnedSessionIds: Array.isArray(saved.pinnedSessionIds) ? saved.pinnedSessionIds : [],
+          sessionOrderIds: Array.isArray(saved.sessionOrderIds) ? saved.sessionOrderIds : [],
+          groupBy: saved.groupBy || "project",
+          sortBy: saved.sortBy || "custom",
+        };
+      }
+    } catch {}
+    return {
+      pinnedSessionIds: [],
+      sessionOrderIds: [],
+      groupBy: "project",
+      sortBy: "custom",
+    };
+  })(),
   overlayDepth: 0,
   stickToBottom: true,
   expandAllTrace: localStorage.getItem("ra_expand_all_trace") === "1",
@@ -388,6 +408,11 @@ function handleLiveWsMessage(msg) {
       banner.style.display = "none";
       banner.innerHTML = "";
     }
+  } else if (msg.type === "ui_prefs_updated" && msg.uiPrefs) {
+    state.uiPrefs = msg.uiPrefs;
+    localStorage.setItem("ra_ui_prefs_v1", JSON.stringify(state.uiPrefs));
+    syncArrangeSelects();
+    renderSessionsList();
   } else if (msg.type === "sessions_updated") {
     loadSessionsList(false);
   } else if (msg.type === "steering_queued") {
@@ -541,6 +566,20 @@ function schedulePrefetchTopSessions() {
 async function loadHostStatus() {
   try {
     state.hostStatus = await apiFetch("/api/status");
+    if (state.hostStatus?.uiPrefs) {
+      // Merge server uiPrefs if non-empty or adopt server state
+      const sp = state.hostStatus.uiPrefs;
+      if (
+        (sp.pinnedSessionIds && sp.pinnedSessionIds.length > 0) ||
+        (sp.sessionOrderIds && sp.sessionOrderIds.length > 0) ||
+        state.uiPrefs.pinnedSessionIds.length === 0
+      ) {
+        state.uiPrefs = sp;
+        localStorage.setItem("ra_ui_prefs_v1", JSON.stringify(state.uiPrefs));
+        syncArrangeSelects();
+        renderSessionsList();
+      }
+    }
     if (!state.activePeerId && state.hostStatus) {
       state.hubHostname = state.hostStatus.hostname;
       state.hubPeerHosts = state.hostStatus.peerHosts || [];
@@ -689,6 +728,7 @@ function applySessionPayload(data, scrollBottom = false) {
   state.activeSession = data.session;
   state.turns = data.turns || [];
   state.artifacts = data.artifacts || [];
+  state.subAgents = data.subAgents || [];
   state.todos = data.todos || [];
   state.reviews = data.reviews || [];
   state.pendingSteering = data.pendingSteering || [];
@@ -703,6 +743,7 @@ function applySessionPayload(data, scrollBottom = false) {
         session: data.session,
         turns: (data.turns || []).slice(-60),
         artifacts: (data.artifacts || []).slice(0, 40),
+        subAgents: (data.subAgents || []).slice(0, 40),
         todos: data.todos || [],
         reviews: data.reviews || [],
         pendingSteering: data.pendingSteering || [],
@@ -856,8 +897,71 @@ function renderMcpStrip() {
     .join("");
 }
 
+function syncArrangeSelects() {
+  const grpSel = document.getElementById("sessionGroupBySelect");
+  const srtSel = document.getElementById("sessionSortBySelect");
+  if (grpSel && state.uiPrefs?.groupBy) grpSel.value = state.uiPrefs.groupBy;
+  if (srtSel && state.uiPrefs?.sortBy) srtSel.value = state.uiPrefs.sortBy;
+}
+
+async function saveUiPrefsToServer() {
+  try {
+    localStorage.setItem("ra_ui_prefs_v1", JSON.stringify(state.uiPrefs));
+    await apiFetch("/api/ui-prefs", {
+      method: "POST",
+      body: state.uiPrefs,
+    });
+  } catch {}
+}
+
+function togglePinSession(sessionId) {
+  const pinned = [...(state.uiPrefs.pinnedSessionIds || [])];
+  const idx = pinned.indexOf(sessionId);
+  if (idx >= 0) {
+    pinned.splice(idx, 1);
+  } else {
+    pinned.unshift(sessionId);
+  }
+  state.uiPrefs.pinnedSessionIds = pinned;
+  renderSessionsList();
+  saveUiPrefsToServer();
+}
+
+function moveSessionInOrder(sessionId, delta, currentIdsList) {
+  const isPinned = (state.uiPrefs.pinnedSessionIds || []).includes(sessionId);
+  if (isPinned) {
+    const pinned = [...state.uiPrefs.pinnedSessionIds];
+    const i = pinned.indexOf(sessionId);
+    const nextIdx = i + delta;
+    if (i < 0 || nextIdx < 0 || nextIdx >= pinned.length) return;
+    const [item] = pinned.splice(i, 1);
+    pinned.splice(nextIdx, 0, item);
+    state.uiPrefs.pinnedSessionIds = pinned;
+  } else {
+    const baseOrder =
+      state.uiPrefs.sessionOrderIds && state.uiPrefs.sessionOrderIds.length > 0
+        ? [...state.uiPrefs.sessionOrderIds]
+        : [...currentIdsList];
+    // Ensure all current IDs exist in baseOrder
+    for (const id of currentIdsList) {
+      if (!baseOrder.includes(id)) baseOrder.push(id);
+    }
+    const i = baseOrder.indexOf(sessionId);
+    const nextIdx = i + delta;
+    if (i < 0 || nextIdx < 0 || nextIdx >= baseOrder.length) return;
+    const [item] = baseOrder.splice(i, 1);
+    baseOrder.splice(nextIdx, 0, item);
+    state.uiPrefs.sessionOrderIds = baseOrder;
+    state.uiPrefs.sortBy = "custom";
+    syncArrangeSelects();
+  }
+  renderSessionsList();
+  saveUiPrefsToServer();
+}
+
 function renderSessionCardHtml(s, isChild = false) {
   const isActive = s.id === state.activeSessionId;
+  const isPinned = (state.uiPrefs?.pinnedSessionIds || []).includes(s.id);
   let badgeClass = s.isRunning ? "badge-busy" : "badge-idle";
   let badgeText = s.isRunning ? "Running" : "";
   if (s.awaitingUserInput) {
@@ -871,16 +975,37 @@ function renderSessionCardHtml(s, isChild = false) {
     badgeText = "Paused";
   }
 
+  const runningAgents = s.counts?.runningSubAgents || 0;
+  const totalAgents = s.counts?.subAgents || 0;
+  const childCount = state.sessions.filter((x) => x.parentSessionId === s.id).length;
+  let subAgentBadgeHtml = "";
+  if (runningAgents > 0) {
+    subAgentBadgeHtml = `<span class="subagent-badge" title="Active background sub-agents">⚡ ${runningAgents} agent${runningAgents > 1 ? "s" : ""}</span>`;
+  } else if (totalAgents > 0 || childCount > 0) {
+    const countLabel = totalAgents + childCount;
+    subAgentBadgeHtml = `<span class="subagent-badge" title="Sub-agents / child sessions">${countLabel} sub-agent${countLabel > 1 ? "s" : ""}</span>`;
+  } else if (s.parentSessionId && !isChild) {
+    subAgentBadgeHtml = `<span class="subagent-badge" title="Child / Sub-session">Sub-session</span>`;
+  }
+
   return `
     <div class="session-card ${isActive ? "active" : ""} ${isChild ? "child-session" : ""}" data-session-id="${escapeHtml(s.id)}">
       <div class="session-card-top">
         <div class="session-card-title">${isChild ? "↳ " : ""}${escapeHtml(s.title)}</div>
-        ${badgeText ? `<span class="badge ${badgeClass}">${badgeText}</span>` : ""}
+        <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
+          ${subAgentBadgeHtml}
+          ${badgeText ? `<span class="badge ${badgeClass}">${badgeText}</span>` : ""}
+        </div>
       </div>
       <div class="session-card-meta">
         ${s.accountLogin ? `<span style="color:var(--text-secondary);">@${escapeHtml(s.accountLogin)}</span>` : ""}
         ${s.branch ? `<span>#${escapeHtml(s.branch)}</span>` : ""}
         <span>${formatTimeAgo(s.updatedAt)}</span>
+        <div class="session-card-actions">
+          <button class="session-action-btn move-up-btn" data-session-id="${escapeHtml(s.id)}" title="Move Up">↑</button>
+          <button class="session-action-btn move-down-btn" data-session-id="${escapeHtml(s.id)}" title="Move Down">↓</button>
+          <button class="session-action-btn pin-btn ${isPinned ? "pinned" : ""}" data-session-id="${escapeHtml(s.id)}" title="${isPinned ? "Unpin session" : "Pin session to top"}">${isPinned ? "★" : "☆"}</button>
+        </div>
       </div>
     </div>
   `;
@@ -893,67 +1018,159 @@ function renderSessionsList() {
     .toLowerCase();
   if (!listEl) return;
 
-  const filtered = state.sessions.filter((s) => {
-    if (!searchVal) return true;
-    const hay = `${s.title} ${s.projectName || ""} ${s.repository || ""} ${s.branch || ""}`.toLowerCase();
-    return hay.includes(searchVal);
-  });
+  const pinnedIds = state.uiPrefs?.pinnedSessionIds || [];
+  const orderIds = state.uiPrefs?.sessionOrderIds || [];
+  const groupBy = state.uiPrefs?.groupBy || "project";
+  const sortBy = state.uiPrefs?.sortBy || "custom";
+
+  const orderIndexMap = new Map(orderIds.map((id, idx) => [id, idx]));
+
+  const sortItems = (arr) => {
+    return [...arr].sort((a, b) => {
+      if (sortBy === "title") {
+        return (a.title || "").localeCompare(b.title || "");
+      }
+      if (sortBy === "recent") {
+        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+      }
+      // "custom": respect orderIds first, then running status, then updatedAt
+      const ia = orderIndexMap.has(a.id) ? orderIndexMap.get(a.id) : 999999;
+      const ib = orderIndexMap.has(b.id) ? orderIndexMap.get(b.id) : 999999;
+      if (ia !== ib) return ia - ib;
+      if (a.isRunning !== b.isRunning) return a.isRunning ? -1 : 1;
+      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+    });
+  };
+
+  const filtered = sortItems(
+    state.sessions.filter((s) => {
+      if (!searchVal) return true;
+      const hay = `${s.title} ${s.projectName || ""} ${s.repository || ""} ${s.branch || ""}`.toLowerCase();
+      return hay.includes(searchVal);
+    })
+  );
+
+  const visibleOrderIds = filtered.map((s) => s.id);
 
   if (searchVal) {
     listEl.innerHTML = filtered.map((s) => renderSessionCardHtml(s, false)).join("");
   } else {
+    const pinnedSet = new Set(pinnedIds);
     const byId = new Map(filtered.map((s) => [s.id, s]));
-    const childrenByParent = new Map();
-    for (const s of filtered) {
-      if (s.parentSessionId && byId.has(s.parentSessionId)) {
-        const arr = childrenByParent.get(s.parentSessionId) || [];
-        arr.push(s);
-        childrenByParent.set(s.parentSessionId, arr);
-      }
-    }
+    const pinnedSessions = pinnedIds.map((id) => byId.get(id)).filter(Boolean);
+    const unpinned = filtered.filter((s) => !pinnedSet.has(s.id));
 
-    const renderWithChildren = (s) => {
-      const kids = childrenByParent.get(s.id) || [];
-      return (
-        renderSessionCardHtml(s, false) +
-        kids.map((k) => renderSessionCardHtml(k, true)).join("")
-      );
-    };
-
-    const topLevel = filtered.filter((s) => !(s.parentSessionId && byId.has(s.parentSessionId)));
-    const projectGroups = new Map();
-    const chats = [];
-
-    for (const s of topLevel) {
-      if (s.sessionType === "general_chat" && !s.projectName) {
-        chats.push(s);
-      } else {
-        const key = s.projectName || s.repository || "Workspace";
-        const grp = projectGroups.get(key) || [];
-        grp.push(s);
-        projectGroups.set(key, grp);
-      }
-    }
-
+    const pinSvg = `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
     const folderSvg = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
     const chatSvg = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
 
     const sectionsHtml = [];
-    for (const [projName, items] of projectGroups.entries()) {
+    if (pinnedSessions.length > 0) {
       sectionsHtml.push(
-        `<div class="session-group-label">${folderSvg} <span>${escapeHtml(projName)}</span></div>` +
-          items.map(renderWithChildren).join("")
+        `<div class="session-group-label" style="color:#58a6ff;">${pinSvg} <span>Pinned (${pinnedSessions.length})</span></div>` +
+          pinnedSessions.map((s) => renderSessionCardHtml(s, false)).join("")
       );
     }
-    if (chats.length > 0) {
+
+    if (groupBy === "flat") {
       sectionsHtml.push(
-        `<div class="session-group-label">${chatSvg} <span>Chats</span></div>` +
-          chats.map(renderWithChildren).join("")
+        `<div class="session-group-label">${folderSvg} <span>All Sessions (${unpinned.length})</span></div>` +
+          unpinned.map((s) => renderSessionCardHtml(s, false)).join("")
       );
+    } else if (groupBy === "status") {
+      const activeList = unpinned.filter(
+        (s) => s.isRunning || s.awaitingUserInput || s.awaitingPlanApproval
+      );
+      const idleList = unpinned.filter(
+        (s) => !(s.isRunning || s.awaitingUserInput || s.awaitingPlanApproval)
+      );
+      if (activeList.length > 0) {
+        sectionsHtml.push(
+          `<div class="session-group-label" style="color:var(--success);"><span>● Active &amp; Waiting (${activeList.length})</span></div>` +
+            activeList.map((s) => renderSessionCardHtml(s, false)).join("")
+        );
+      }
+      if (idleList.length > 0) {
+        sectionsHtml.push(
+          `<div class="session-group-label"><span>Idle Sessions (${idleList.length})</span></div>` +
+            idleList.map((s) => renderSessionCardHtml(s, false)).join("")
+        );
+      }
+    } else {
+      // "project": Group by Project folders with child session nesting under parent
+      const unpinnedById = new Map(unpinned.map((s) => [s.id, s]));
+      const childrenByParent = new Map();
+      for (const s of unpinned) {
+        if (s.parentSessionId && unpinnedById.has(s.parentSessionId)) {
+          const arr = childrenByParent.get(s.parentSessionId) || [];
+          arr.push(s);
+          childrenByParent.set(s.parentSessionId, arr);
+        }
+      }
+
+      const renderWithChildren = (s) => {
+        const kids = childrenByParent.get(s.id) || [];
+        return (
+          renderSessionCardHtml(s, false) +
+          kids.map((k) => renderSessionCardHtml(k, true)).join("")
+        );
+      };
+
+      const topLevel = unpinned.filter((s) => !(s.parentSessionId && unpinnedById.has(s.parentSessionId)));
+      const projectGroups = new Map();
+      const chats = [];
+
+      for (const s of topLevel) {
+        if (s.sessionType === "general_chat" && !s.projectName) {
+          chats.push(s);
+        } else {
+          const key = s.projectName || s.repository || "Workspace";
+          const grp = projectGroups.get(key) || [];
+          grp.push(s);
+          projectGroups.set(key, grp);
+        }
+      }
+
+      for (const [projName, items] of projectGroups.entries()) {
+        sectionsHtml.push(
+          `<div class="session-group-label">${folderSvg} <span>${escapeHtml(projName)}</span></div>` +
+            items.map(renderWithChildren).join("")
+        );
+      }
+      if (chats.length > 0) {
+        sectionsHtml.push(
+          `<div class="session-group-label">${chatSvg} <span>Chats</span></div>` +
+            chats.map(renderWithChildren).join("")
+        );
+      }
     }
 
     listEl.innerHTML = sectionsHtml.join("");
   }
+
+  listEl.querySelectorAll(".pin-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute("data-session-id");
+      if (id) togglePinSession(id);
+    });
+  });
+
+  listEl.querySelectorAll(".move-up-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute("data-session-id");
+      if (id) moveSessionInOrder(id, -1, visibleOrderIds);
+    });
+  });
+
+  listEl.querySelectorAll(".move-down-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute("data-session-id");
+      if (id) moveSessionInOrder(id, 1, visibleOrderIds);
+    });
+  });
 
   listEl.querySelectorAll(".session-card").forEach((card) => {
     card.addEventListener("click", () => {
@@ -1175,6 +1392,26 @@ function formatNativeToolRow(tc) {
     iconText = b.txt;
     primaryLabel = `${name === "create" ? "Create" : "Edit"} ${baseName(args.path)}`;
     secondaryText = toRelativePath(args.path);
+  } else if (name === "task" || tc.subAgent) {
+    const sa = tc.subAgent || {};
+    iconClass = "mcp";
+    iconText = sa.mode === "background" || args.mode === "background" ? "BG" : "SUB";
+    const agentName = sa.name || args.name || args.agent_id || "sub-agent";
+    const agentType = sa.agentType || args.agent_type || "agent";
+    const desc = sa.description || args.description || tc.toolTitle || agentName;
+    primaryLabel = `Sub-Agent [${agentName}] · ${desc}`;
+    const statsParts = [agentType];
+    if (sa.model) statsParts.push(sa.model);
+    if (sa.totalToolCalls) statsParts.push(`${sa.totalToolCalls} tools`);
+    if (sa.totalTokens) statsParts.push(`${formatCompactNum(sa.totalTokens)} tok`);
+    if (sa.durationMs) statsParts.push(`${Math.round(sa.durationMs / 1000)}s`);
+    secondaryText = statsParts.join(" · ");
+  } else if (name === "read_agent" || name === "write_agent") {
+    iconClass = "mcp";
+    iconText = "SUB";
+    const targetId = args.agent_id || (Array.isArray(args.agent_ids) ? args.agent_ids.join(",") : "agent");
+    primaryLabel = `${name === "read_agent" ? "Read sub-agent" : "Message sub-agent"} [${targetId}]`;
+    secondaryText = tc.intentionSummary || "";
   } else if (name === "grep" || name === "glob") {
     iconClass = "ts";
     iconText = "FIND";
@@ -1261,6 +1498,19 @@ function renderWorkspaceStatusBar() {
   if (artCount > 0) {
     pills.push(
       `<button class="ws-pill" data-jump-tab="artifacts">Artifacts <span style="color:#94a3b8">${artCount}</span></button>`
+    );
+  }
+
+  const childSessionsCount = state.sessions.filter((x) => x.parentSessionId === s.id).length;
+  const subAgentsCount = (state.subAgents?.length || s.counts?.subAgents || 0) + childSessionsCount;
+  if (subAgentsCount > 0) {
+    const runningCount =
+      (state.subAgents ? state.subAgents.filter((a) => a.status === "running").length : s.counts?.runningSubAgents || 0) +
+      state.sessions.filter((x) => x.parentSessionId === s.id && x.isRunning).length;
+    pills.push(
+      `<button class="ws-pill" data-jump-tab="todos" title="View Sub-Agents &amp; Child Sessions">Agents <span style="color:${
+        runningCount > 0 ? "#d2a8ff" : "#94a3b8"
+      }">${runningCount > 0 ? `${runningCount} active / ` : ""}${subAgentsCount}</span></button>`
     );
   }
 
@@ -2625,6 +2875,113 @@ function renderTodosAndMcps() {
     });
   }
 
+  // Render Background & Sub-Agents + Child/Parent Sessions
+  const subAgentsEl = document.getElementById("subAgentsContainer");
+  if (subAgentsEl) {
+    const s = state.activeSession;
+    const parentSess = s?.parentSessionId
+      ? state.sessions.find((x) => x.id === s.parentSessionId)
+      : null;
+    const childSessions = s
+      ? state.sessions.filter((x) => x.parentSessionId === s.id)
+      : [];
+    const subAgents = state.subAgents || [];
+
+    const blocks = [];
+    if (parentSess) {
+      blocks.push(`
+        <div class="turn-card" style="padding: 10px 12px; border-color: rgba(163, 113, 247, 0.4);">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <div>
+              <div style="font-size:11px;color:#d2a8ff;font-weight:600;">PARENT COORDINATOR SESSION</div>
+              <div style="font-weight:600;font-size:13px;">${escapeHtml(parentSess.title)}</div>
+            </div>
+            <button class="btn btn-sm jump-session-btn" data-target-session="${escapeHtml(parentSess.id)}">Open Parent</button>
+          </div>
+        </div>
+      `);
+    }
+
+    if (childSessions.length > 0) {
+      blocks.push(
+        `<strong>Coordinated Child Sessions (${childSessions.length})</strong>` +
+          childSessions
+            .map(
+              (cs) => `
+              <div class="turn-card" style="padding: 10px 12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+                  <div>
+                    <div style="font-weight:600;font-size:13px;">↳ ${escapeHtml(cs.title)}</div>
+                    <div style="font-size:11.5px;color:var(--text-secondary);">
+                      ${cs.branch ? `#${escapeHtml(cs.branch)} · ` : ""}${escapeHtml(cs.model || "auto")} · ${formatTimeAgo(cs.updatedAt)}
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:6px;align-items:center;">
+                    <span class="badge ${cs.isRunning ? "badge-busy" : "badge-idle"}">${cs.isRunning ? "RUNNING" : "IDLE"}</span>
+                    <button class="btn btn-sm jump-session-btn" data-target-session="${escapeHtml(cs.id)}">Open</button>
+                  </div>
+                </div>
+              </div>`
+            )
+            .join("")
+      );
+    }
+
+    if (subAgents.length > 0) {
+      const runningCnt = subAgents.filter((a) => a.status === "running").length;
+      blocks.push(
+        `<strong>Background &amp; Sub-Agents (${
+          runningCnt > 0 ? `${runningCnt} running / ` : ""
+        }${subAgents.length} total)</strong>` +
+          subAgents
+            .map((sa) => {
+              const badgeCls =
+                sa.status === "running"
+                  ? "badge-busy"
+                  : sa.status === "failed"
+                  ? "badge-alert"
+                  : "badge-idle";
+              const stats = [];
+              stats.push(sa.mode === "background" ? "Background" : "Sync");
+              stats.push(sa.agentType);
+              if (sa.model) stats.push(sa.model);
+              if (sa.totalToolCalls) stats.push(`${sa.totalToolCalls} tools`);
+              if (sa.totalTokens) stats.push(`${formatCompactNum(sa.totalTokens)} tokens`);
+              if (sa.durationMs) stats.push(`${Math.round(sa.durationMs / 1000)}s`);
+              return `
+                <details class="turn-card" style="padding: 10px 12px;">
+                  <summary style="cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <div>
+                      <div style="font-weight:600;font-size:13px;">[${escapeHtml(sa.name)}] ${escapeHtml(sa.description)}</div>
+                      <div style="font-size:11.5px;color:var(--text-secondary);">${escapeHtml(stats.join(" · "))}</div>
+                    </div>
+                    <span class="badge ${badgeCls}">${escapeHtml(sa.status.toUpperCase())}</span>
+                  </summary>
+                  <div class="tool-call-details" style="margin-top:8px;">${
+                    sa.promptPreview ? `Task Prompt:\n${escapeHtml(sa.promptPreview)}\n\n` : ""
+                  }${
+                sa.resultPreview
+                  ? `Sub-Agent Output:\n${escapeHtml(sa.resultPreview)}`
+                  : "No output recorded yet."
+              }</div>
+                </details>`;
+            })
+            .join("")
+      );
+    }
+
+    subAgentsEl.innerHTML = blocks.join("");
+    subAgentsEl.querySelectorAll(".jump-session-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const targetId = btn.getAttribute("data-target-session");
+        if (targetId) {
+          selectSession(targetId);
+          document.querySelector('.view-tab[data-tab="stream"]')?.click();
+        }
+      });
+    });
+  }
+
   if (state.todos.length === 0) {
     todosEl.innerHTML = `<div style="color: var(--text-secondary);">No session SQLite todos recorded for this session.</div>`;
   } else {
@@ -2905,6 +3262,18 @@ function setupEventListeners() {
 
   document.getElementById("sessionSearchInput")?.addEventListener("input", () => {
     renderSessionsList();
+  });
+
+  document.getElementById("sessionGroupBySelect")?.addEventListener("change", (e) => {
+    state.uiPrefs.groupBy = e.target.value;
+    renderSessionsList();
+    saveUiPrefsToServer();
+  });
+
+  document.getElementById("sessionSortBySelect")?.addEventListener("change", (e) => {
+    state.uiPrefs.sortBy = e.target.value;
+    renderSessionsList();
+    saveUiPrefsToServer();
   });
 
   document.getElementById("openQrBtn")?.addEventListener("click", openQrModal);
@@ -3429,6 +3798,7 @@ async function init() {
     }
   }
   setupEventListeners();
+  syncArrangeSelects();
   setupAnnotationCanvasEvents();
   setupStlCanvasEvents();
 

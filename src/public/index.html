@@ -60,6 +60,18 @@
           <div id="hostSwitcherStrip" class="host-switcher-strip"></div>
           <div id="quotaDrawerCard" class="quota-drawer-card" style="display: none;"></div>
           <input id="sessionSearchInput" type="search" class="search-input" placeholder="Search sessions, repos, @accounts..." />
+          <div class="session-arrange-bar">
+            <select id="sessionGroupBySelect" class="mode-select" style="flex: 1; font-size: 11px;" title="Group sessions by">
+              <option value="project">Group: Folders</option>
+              <option value="flat">Group: Flat List</option>
+              <option value="status">Group: Active First</option>
+            </select>
+            <select id="sessionSortBySelect" class="mode-select" style="flex: 1; font-size: 11px;" title="Sort sessions by">
+              <option value="custom">Sort: Custom</option>
+              <option value="recent">Sort: Recent</option>
+              <option value="title">Sort: A–Z</option>
+            </select>
+          </div>
           <div id="mcpStrip" class="mcp-strip" title="Active Desktop MCP Servers"></div>
         </div>
         <div id="sessionsList" class="sessions-list"></div>
@@ -125,9 +137,10 @@
           <div id="diffContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
         </section>
 
-        <!-- Tab 4: Copilot Monthly Quota, Session Plan / Todos & Desktop MCP Status -->
+        <!-- Tab 4: Copilot Monthly Quota, Sub-Agents, Session Plan / Todos & Desktop MCP Status -->
         <section id="tab-todos" class="tab-pane">
           <div id="quotaDetailsContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+          <div id="subAgentsContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
           <div id="todosContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
           <div id="mcpDetailsContainer" style="display: flex; flex-direction: column; gap: 10px; margin-top: 12px;"></div>
         </section>

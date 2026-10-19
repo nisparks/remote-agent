@@ -183,12 +183,36 @@ describe("RemoteAgentServer & Desktop Copilot Bridge", () => {
       session: { id: string };
       turns: unknown[];
       artifacts: unknown[];
+      subAgents: unknown[];
       todos: unknown[];
     };
     assert.equal(detail.session.id, targetId);
     assert.ok(Array.isArray(detail.turns));
     assert.ok(Array.isArray(detail.artifacts));
+    assert.ok(Array.isArray(detail.subAgents));
     assert.ok(Array.isArray(detail.todos));
+
+    // Verify UI session pinning & custom arrangement preferences (/api/ui-prefs)
+    const prefsRes = await fetch(`${baseUrl}/api/ui-prefs`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${testToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        pinnedSessionIds: [targetId],
+        sessionOrderIds: [targetId],
+        groupBy: "project",
+        sortBy: "custom",
+      }),
+    });
+    assert.equal(prefsRes.status, 200);
+    const prefsData = (await prefsRes.json()) as {
+      ok: boolean;
+      uiPrefs: { pinnedSessionIds: string[]; groupBy: string };
+    };
+    assert.equal(prefsData.ok, true);
+    assert.deepEqual(prefsData.uiPrefs.pinnedSessionIds, [targetId]);
   });
 
   it("blocks access to sensitive token files and paths outside allowed roots", async () => {

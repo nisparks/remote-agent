@@ -282,6 +282,53 @@ html, body {
   border-color: var(--accent);
 }
 
+.session-arrange-bar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.session-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.session-action-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.session-action-btn:hover {
+  background: var(--bg-elevated);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+.session-action-btn.pinned {
+  color: #58a6ff;
+  background: rgba(56, 139, 253, 0.14);
+}
+
+.subagent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(163, 113, 247, 0.14);
+  color: #d2a8ff;
+  border: 1px solid rgba(163, 113, 247, 0.35);
+}
+
 .mcp-strip {
   display: flex;
   flex-wrap: wrap;

@@ -40,6 +40,32 @@ export interface PendingPermissionRequest {
   timestamp: string;
 }
 
+export interface SubAgentItem {
+  id: string;
+  toolCallId: string;
+  name: string;
+  agentType: string;
+  displayName: string;
+  description: string;
+  mode: "sync" | "background";
+  status: "running" | "completed" | "failed";
+  model?: string;
+  totalToolCalls?: number;
+  totalTokens?: number;
+  durationMs?: number;
+  startedAt: string;
+  completedAt?: string;
+  promptPreview?: string;
+  resultPreview?: string;
+}
+
+export interface UiPreferences {
+  pinnedSessionIds: string[];
+  sessionOrderIds: string[];
+  groupBy: "project" | "flat" | "status";
+  sortBy: "custom" | "recent" | "title";
+}
+
 export interface ToolCallItem {
   toolCallId: string;
   toolName: string;
@@ -53,6 +79,7 @@ export interface ToolCallItem {
   startedAt: string;
   completedAt?: string;
   artifacts: ArtifactItem[];
+  subAgent?: SubAgentItem;
 }
 
 export interface ConversationTurn {
@@ -144,6 +171,8 @@ export interface RemoteSessionSummary {
     models3d: number;
     todos: number;
     todosDone: number;
+    subAgents?: number;
+    runningSubAgents?: number;
   };
 }
 
@@ -238,4 +267,5 @@ export interface DesktopHostStatus {
   activeSessionsCount: number;
   totalSessionsCount: number;
   uiVersion?: string;
+  uiPrefs?: UiPreferences;
 }

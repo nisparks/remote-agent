@@ -20,7 +20,9 @@ import type {
   RemoteSessionSummary,
   SessionMode,
   SessionTodoItem,
+  SubAgentItem,
   ToolCallItem,
+  UiPreferences,
   WorkspaceDiffFile,
   WorkspaceDiffSummary,
 } from "./types.js";
@@ -33,6 +35,7 @@ const DATA_DB_PATH = path.join(COPILOT_HOME, "data.db");
 const MCP_CONFIG_PATH = path.join(COPILOT_HOME, "mcp-config.json");
 const REVIEWS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-reviews.json");
 const PEERS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-peers.json");
+const UI_PREFS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-ui-prefs.json");
 
 const EXTENSION_MIME_MAP: Record<string, { category: ArtifactCategory; mime: string }> = {
   ".png": { category: "image", mime: "image/png" },
@@ -164,6 +167,7 @@ export class SessionStateStore {
       data: {
         turns: ConversationTurn[];
         artifacts: ArtifactItem[];
+        subAgents: SubAgentItem[];
         awaitingUserInput: PendingUserInput | null;
         awaitingPlanApproval: PendingPlanApproval | null;
         awaitingPermission: PendingPermissionRequest | null;
@@ -398,6 +402,52 @@ export class SessionStateStore {
       fs.writeFileSync(PEERS_FILE_PATH, JSON.stringify(peers, null, 2), "utf8");
     } catch {}
     return peers;
+  }
+
+  getUiPreferences(): UiPreferences {
+    const defaults: UiPreferences = {
+      pinnedSessionIds: [],
+      sessionOrderIds: [],
+      groupBy: "project",
+      sortBy: "custom",
+    };
+    try {
+      if (fs.existsSync(UI_PREFS_FILE_PATH)) {
+        const raw = JSON.parse(fs.readFileSync(UI_PREFS_FILE_PATH, "utf8")) as Partial<UiPreferences>;
+        return {
+          pinnedSessionIds: Array.isArray(raw.pinnedSessionIds) ? raw.pinnedSessionIds.map(String) : [],
+          sessionOrderIds: Array.isArray(raw.sessionOrderIds) ? raw.sessionOrderIds.map(String) : [],
+          groupBy: raw.groupBy === "flat" || raw.groupBy === "status" ? raw.groupBy : "project",
+          sortBy: raw.sortBy === "recent" || raw.sortBy === "title" ? raw.sortBy : "custom",
+        };
+      }
+    } catch {}
+    return defaults;
+  }
+
+  saveUiPreferences(patch: Partial<UiPreferences>): UiPreferences {
+    const current = this.getUiPreferences();
+    const updated: UiPreferences = {
+      pinnedSessionIds: Array.isArray(patch.pinnedSessionIds)
+        ? patch.pinnedSessionIds.map(String)
+        : current.pinnedSessionIds,
+      sessionOrderIds: Array.isArray(patch.sessionOrderIds)
+        ? patch.sessionOrderIds.map(String)
+        : current.sessionOrderIds,
+      groupBy:
+        patch.groupBy === "project" || patch.groupBy === "flat" || patch.groupBy === "status"
+          ? patch.groupBy
+          : current.groupBy,
+      sortBy:
+        patch.sortBy === "custom" || patch.sortBy === "recent" || patch.sortBy === "title"
+          ? patch.sortBy
+          : current.sortBy,
+    };
+    try {
+      fs.mkdirSync(path.dirname(UI_PREFS_FILE_PATH), { recursive: true });
+      fs.writeFileSync(UI_PREFS_FILE_PATH, JSON.stringify(updated, null, 2), "utf8");
+    } catch {}
+    return updated;
   }
 
   getCopilotHome(): string {
@@ -919,6 +969,27 @@ export class SessionStateStore {
       }
     }
 
+    let subAgents = 0;
+    let runningSubAgents = 0;
+    const eventsPath = path.join(folder, "events.jsonl");
+    if (fs.existsSync(eventsPath)) {
+      try {
+        const stat = fs.statSync(eventsPath);
+        if (stat.size <= 16 * 1024 * 1024) {
+          const raw = fs.readFileSync(eventsPath, "utf8");
+          const startedMatches = raw.match(/"subagent\.started"/g);
+          const completedMatches = raw.match(/"subagent\.completed"/g);
+          subAgents = startedMatches ? startedMatches.length : 0;
+          const completedCount = completedMatches ? completedMatches.length : 0;
+          if (this.hasActiveLockFile(folder) && subAgents > completedCount) {
+            runningSubAgents = subAgents - completedCount;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
     const counts = {
       turns: 0,
       artifacts,
@@ -926,6 +997,8 @@ export class SessionStateStore {
       models3d,
       todos,
       todosDone,
+      subAgents,
+      runningSubAgents,
     };
     this.quickCountsCache.set(sessionId, { counts, cachedAt: Date.now() });
     return counts;
@@ -1005,6 +1078,7 @@ export class SessionStateStore {
   getSessionConversationAndArtifacts(sessionId: string, cwd?: string): {
     turns: ConversationTurn[];
     artifacts: ArtifactItem[];
+    subAgents: SubAgentItem[];
     awaitingUserInput: PendingUserInput | null;
     awaitingPlanApproval: PendingPlanApproval | null;
     awaitingPermission: PendingPermissionRequest | null;
@@ -1147,6 +1221,8 @@ export class SessionStateStore {
     const turns: ConversationTurn[] = [];
     const toolCallsById = new Map<string, ToolCallItem>();
     const toolCallOwnerTurn = new Map<string, ConversationTurn>();
+    const subAgentsByCallId = new Map<string, SubAgentItem>();
+    const subAgentsByName = new Map<string, SubAgentItem>();
     let awaitingUserInput: PendingUserInput | null = null;
     let awaitingPlanApproval: PendingPlanApproval | null = null;
     let awaitingPermission: PendingPermissionRequest | null = null;
@@ -1322,6 +1398,30 @@ export class SessionStateStore {
                 toolCallOwnerTurn.set(callId, turn);
               }
 
+              if (toolName === "task") {
+                const agentName = String(args.name || args.agent_id || callId.slice(0, 8));
+                const agentType = String(args.agent_type || "task");
+                const desc = String(args.description || tc.toolTitle || tc.intentionSummary || agentName);
+                const mode = args.mode === "background" ? "background" : "sync";
+                const promptPreview =
+                  typeof args.prompt === "string" ? args.prompt.slice(0, 600) : undefined;
+                const sa: SubAgentItem = {
+                  id: agentName,
+                  toolCallId: callId,
+                  name: agentName,
+                  agentType,
+                  displayName: agentType,
+                  description: desc,
+                  mode,
+                  status: "running",
+                  startedAt: timestamp,
+                  promptPreview,
+                };
+                tc.subAgent = sa;
+                subAgentsByCallId.set(callId, sa);
+                subAgentsByName.set(agentName, sa);
+              }
+
               if (toolName === "ask_user") {
                 awaitingUserInput = {
                   requestId: callId,
@@ -1362,6 +1462,33 @@ export class SessionStateStore {
             if (turn.content || turn.reasoningText || turn.toolCalls.length > 0) {
               turns.push(turn);
             }
+          } else if (type === "subagent.started") {
+            const callId = String(data.toolCallId || "");
+            const sa = subAgentsByCallId.get(callId);
+            if (sa) {
+              if (typeof data.agentDisplayName === "string") sa.displayName = data.agentDisplayName;
+              if (typeof data.agentName === "string") sa.agentType = data.agentName;
+            }
+          } else if (type === "subagent.completed") {
+            const callId = String(data.toolCallId || "");
+            const sa = subAgentsByCallId.get(callId);
+            if (sa) {
+              sa.status = "completed";
+              sa.completedAt = timestamp;
+              if (typeof data.model === "string") sa.model = data.model;
+              if (typeof data.totalToolCalls === "number") sa.totalToolCalls = data.totalToolCalls;
+              if (typeof data.totalTokens === "number") sa.totalTokens = data.totalTokens;
+              if (typeof data.durationMs === "number") sa.durationMs = data.durationMs;
+            }
+          } else if (type === "system.notification") {
+            const kind = (data.kind as Record<string, unknown>) || {};
+            if (kind.type === "agent_completed" && typeof kind.agentId === "string") {
+              const sa = subAgentsByName.get(kind.agentId);
+              if (sa) {
+                sa.status = kind.status === "failed" ? "failed" : "completed";
+                sa.completedAt = timestamp;
+              }
+            }
           } else if (type === "tool.execution_start") {
             const callId = String(data.toolCallId || "");
             const tc = toolCallsById.get(callId);
@@ -1392,6 +1519,25 @@ export class SessionStateStore {
                 }
               }
 
+              if (tc.toolName === "task" && tc.subAgent) {
+                const bgMatch = resultContent.match(/agent_id:\s*([a-zA-Z0-9_-]+)/i);
+                if (bgMatch) {
+                  subAgentsByName.set(bgMatch[1], tc.subAgent);
+                } else {
+                  tc.subAgent.status = success ? "completed" : "failed";
+                  tc.subAgent.completedAt = timestamp;
+                  tc.subAgent.resultPreview = resultContent.slice(0, 800);
+                }
+              } else if (tc.toolName === "read_agent") {
+                const targetAgentId = String(tc.arguments?.agent_id || "");
+                const sa = subAgentsByName.get(targetAgentId);
+                if (sa && resultContent) {
+                  sa.resultPreview = resultContent.slice(0, 1000);
+                  sa.status = "completed";
+                  if (!sa.completedAt) sa.completedAt = timestamp;
+                }
+              }
+
               if (tc.toolName === "ask_user" && awaitingUserInput?.requestId === callId) {
                 awaitingUserInput = null;
               }
@@ -1406,6 +1552,16 @@ export class SessionStateStore {
       }
     }
 
+    const sessionStillRunning = this.hasActiveLockFile(folder);
+    const subAgents = [...subAgentsByCallId.values()];
+    if (!sessionStillRunning) {
+      for (const sa of subAgents) {
+        if (sa.status === "running") {
+          sa.status = "completed";
+        }
+      }
+    }
+
     const allArtifacts = [...artifactsByPath.values()].sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
     );
@@ -1414,6 +1570,7 @@ export class SessionStateStore {
     const resultData = {
       turns: turns.slice(-300),
       artifacts,
+      subAgents,
       awaitingUserInput,
       awaitingPlanApproval,
       awaitingPermission,

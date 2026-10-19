@@ -496,6 +496,7 @@ export class RemoteAgentServer {
       activeSessionsCount: sessions.filter((s) => s.isRunning).length,
       totalSessionsCount: sessions.length,
       uiVersion: this.getUiVersion(),
+      uiPrefs: this.store.getUiPreferences(),
     };
   }
 
@@ -826,6 +827,24 @@ export class RemoteAgentServer {
         return;
       }
 
+      if (pathname === "/api/ui-prefs" && method === "GET") {
+        this.sendJson(res, 200, { uiPrefs: this.store.getUiPreferences() });
+        return;
+      }
+
+      if (pathname === "/api/ui-prefs" && method === "POST") {
+        const body = await this.readJsonBody<{
+          pinnedSessionIds?: string[];
+          sessionOrderIds?: string[];
+          groupBy?: "project" | "flat" | "status";
+          sortBy?: "custom" | "recent" | "title";
+        }>(req, 64 * 1024);
+        const uiPrefs = this.store.saveUiPreferences(body);
+        this.broadcast({ type: "ui_prefs_updated", uiPrefs });
+        this.sendJson(res, 200, { ok: true, uiPrefs });
+        return;
+      }
+
       // Transparent LAN-to-WAN Peer Hub Reverse Proxy:
       // Allows a single WAN-exposed desktop (e.g. port 4321) to proxy API & artifact requests
       // to any additional desktop/server on the same local network without needing extra router port-forwards!
@@ -1069,12 +1088,15 @@ export class RemoteAgentServer {
             models3d: details.artifacts.filter((a) => a.category === "3d").length,
             todos: todos.length,
             todosDone: todos.filter((t) => t.status === "done").length,
+            subAgents: details.subAgents.length,
+            runningSubAgents: details.subAgents.filter((sa) => sa.status === "running").length,
           };
 
           this.sendJson(res, 200, {
             session: summary,
             turns: details.turns,
             artifacts: details.artifacts,
+            subAgents: details.subAgents,
             todos,
             reviews,
             streaming,
