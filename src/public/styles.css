@@ -542,6 +542,7 @@ html, body {
 .tab-pane {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px 14px;
   display: none;
   flex-direction: column;
@@ -553,7 +554,7 @@ html, body {
 
 /* Stream / Conversation Turns (Human-crafted Primer Chat) */
 #turnsContainer {
-  overflow-x: hidden;
+  flex-shrink: 0;
 }
 
 .turn-card {

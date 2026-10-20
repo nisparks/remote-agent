@@ -834,8 +834,8 @@ async function selectSession(sessionId) {
   const cached = state.sessionCache.get(sessionId);
   if (cached) {
     applySessionPayload(cached, true);
-    // Revalidate in background while keeping stickToBottom active
-    loadSessionDetail(sessionId, false);
+    // Revalidate in background and ensure we scroll to bottom of fresh turns
+    loadSessionDetail(sessionId, true);
   } else {
     // Immediately update header from state.sessions summary so title switches in 0ms
     const summary = state.sessions.find((s) => s.id === sessionId);
@@ -1399,14 +1399,21 @@ function scrollStreamToBottomIfSticky(force = false) {
   if (!pane) return;
   if (force || state.stickToBottom) {
     state.stickToBottom = true;
-    programmaticScrollUntil = Date.now() + 180;
-    pane.scrollTop = pane.scrollHeight;
-    updateJumpToBottomButton();
+    const snapBottom = () => {
+      programmaticScrollUntil = Date.now() + 220;
+      pane.scrollTop = pane.scrollHeight + 10000;
+      updateJumpToBottomButton();
+    };
+    snapBottom();
     requestAnimationFrame(() => {
       if (force || state.stickToBottom) {
-        programmaticScrollUntil = Date.now() + 180;
-        pane.scrollTop = pane.scrollHeight;
-        updateJumpToBottomButton();
+        snapBottom();
+        setTimeout(() => {
+          if (force || state.stickToBottom) snapBottom();
+        }, 65);
+        setTimeout(() => {
+          if (force || state.stickToBottom) snapBottom();
+        }, 180);
       }
     });
   }
@@ -3822,6 +3829,18 @@ function setupEventListeners() {
     { passive: true }
   );
 
+  const turnsContainerEl = document.getElementById("turnsContainer");
+  if (turnsContainerEl && typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      if (state.stickToBottom && streamPane) {
+        programmaticScrollUntil = Date.now() + 180;
+        streamPane.scrollTop = streamPane.scrollHeight + 10000;
+        updateJumpToBottomButton();
+      }
+    });
+    ro.observe(turnsContainerEl);
+  }
+
   // iMessage / SMS-style swipe-left gesture on #tab-stream to peek message timestamps
   let swipeStartX = 0;
   let swipeStartY = 0;
@@ -4304,7 +4323,7 @@ async function init() {
   connectWebSocket();
   await Promise.all([loadHostStatus(), loadSessionsList(true)]);
   if (state.activeSessionId) {
-    loadSessionDetail(state.activeSessionId, false);
+    loadSessionDetail(state.activeSessionId, true);
   }
 }
 
