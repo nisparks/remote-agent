@@ -11,7 +11,10 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const ANDROID_DIR = path.join(ROOT_DIR, "android");
 const BUILD_DIR = path.join(ANDROID_DIR, "build");
 const RELEASES_DIR = path.join(ROOT_DIR, "releases");
-const OUTPUT_APK = path.join(RELEASES_DIR, "RemoteAgent-android.apk");
+const embedLocal = process.argv.includes("--embed-local");
+const OUTPUT_APK = embedLocal
+  ? path.join(os.homedir(), ".copilot", "RemoteAgent-paired.apk")
+  : path.join(RELEASES_DIR, "RemoteAgent-android.apk");
 
 const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
 const sdkRoot = process.env.ANDROID_HOME || path.join(localAppData, "Android", "Sdk");
@@ -83,7 +86,6 @@ fs.mkdirSync(path.join(BUILD_DIR, "res_merged", "drawable-v26"), { recursive: tr
 fs.mkdirSync(RELEASES_DIR, { recursive: true });
 
 // 1. Prepare clean generic resources (never embed machine-local tokens or personal DDNS domains in repo APK)
-const embedLocal = process.argv.includes("--embed-local");
 const lanUrl = embedLocal ? getLanUrl() : "";
 const token = embedLocal ? getPairingToken() : "";
 const wanUrl = embedLocal ? getWanUrl() : "";

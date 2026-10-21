@@ -94,31 +94,61 @@ public class MainActivity extends Activity {
         String defaultToken = getString(R.string.default_token);
 
         SharedPreferences.Editor ed = prefs.edit();
-        if (!prefs.contains(KEY_LAN_URL) && defaultLan != null && !defaultLan.isEmpty()) {
+        // When an APK is built with embedded local/WAN defaults, always refresh SharedPreferences so stale URLs/tokens are replaced
+        if (defaultLan != null && !defaultLan.isEmpty()) {
             ed.putString(KEY_LAN_URL, defaultLan);
         }
-        if (!prefs.contains(KEY_WAN_URL) && defaultWan != null && !defaultWan.isEmpty()) {
+        if (defaultWan != null && !defaultWan.isEmpty()) {
             ed.putString(KEY_WAN_URL, defaultWan);
+            ed.putString(KEY_LAST_GOOD_URL, defaultWan);
+        } else if (defaultLan != null && !defaultLan.isEmpty()) {
+            ed.putString(KEY_LAST_GOOD_URL, defaultLan);
         }
-        if (!prefs.contains(KEY_TOKEN) && defaultToken != null && !defaultToken.isEmpty()) {
+        if (defaultToken != null && !defaultToken.isEmpty()) {
             ed.putString(KEY_TOKEN, defaultToken);
         }
         ed.apply();
     }
 
     private void connectImmediateOrAuto() {
-        String lastGood = prefs.getString(KEY_LAST_GOOD_URL, "");
-        String wanUrl = prefs.getString(KEY_WAN_URL, "");
-        String lanUrl = prefs.getString(KEY_LAN_URL, "");
-        String token = prefs.getString(KEY_TOKEN, "");
+        final String lastGood = prefs.getString(KEY_LAST_GOOD_URL, "");
+        final String wanUrl = prefs.getString(KEY_WAN_URL, "");
+        final String lanUrl = prefs.getString(KEY_LAN_URL, "");
+        final String token = prefs.getString(KEY_TOKEN, "");
 
-        // Instant zero-latency launch using last verified URL (or HTTPS WAN URL which works on both Wi-Fi Hairpin NAT & 5G)
-        String immediateTarget = (lastGood != null && !lastGood.isEmpty())
+        final String immediateTarget = (lastGood != null && !lastGood.isEmpty())
                 ? lastGood
                 : ((wanUrl != null && !wanUrl.isEmpty()) ? wanUrl : lanUrl);
 
         if (immediateTarget != null && !immediateTarget.isEmpty()) {
             loadEndpointWithToken(immediateTarget, token);
+            // Parallel 1.5s health verification: if immediateTarget doesn't respond, seamlessly switch to whichever endpoint is alive!
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    if (probeEndpoint(immediateTarget)) {
+                        return;
+                    }
+                    String fallback = null;
+                    if (lanUrl != null && !lanUrl.isEmpty() && !lanUrl.equals(immediateTarget) && probeEndpoint(lanUrl)) {
+                        fallback = lanUrl;
+                    } else if (wanUrl != null && !wanUrl.isEmpty() && !wanUrl.equals(immediateTarget) && probeEndpoint(wanUrl)) {
+                        fallback = wanUrl;
+                    }
+                    final String nextTarget = fallback;
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (nextTarget != null) {
+                                prefs.edit().putString(KEY_LAST_GOOD_URL, nextTarget).apply();
+                                loadEndpointWithToken(nextTarget, token);
+                            } else {
+                                showConnectionManagerHtml();
+                            }
+                        }
+                    });
+                }
+            }).start();
         } else {
             autoConnectBestEndpoint();
         }

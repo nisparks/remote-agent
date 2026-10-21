@@ -1558,14 +1558,69 @@ export class RemoteAgentServer {
       return;
     }
 
+    // Quick local mobile install & 1-tap auto-pair page (/install and /apk)
+    if (pathname === "/apk") {
+      const pairedApk = path.join(os.homedir(), ".copilot", "RemoteAgent-paired.apk");
+      const fallbackApk = path.join(RELEASES_DIR, "RemoteAgent-android.apk");
+      const targetApk =
+        fs.existsSync(pairedApk) && fs.statSync(pairedApk).isFile() ? pairedApk : fallbackApk;
+      if (!fs.existsSync(targetApk) || !fs.statSync(targetApk).isFile()) {
+        this.sendJson(res, 404, { error: "Android APK not found" });
+        return;
+      }
+      const stat = fs.statSync(targetApk);
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.android.package-archive",
+        "Content-Length": stat.size,
+        "Content-Disposition": 'attachment; filename="RemoteAgent-android.apk"',
+        "Cache-Control": "no-store",
+      });
+      fs.createReadStream(targetApk).pipe(res);
+      return;
+    }
+
+    if (
+      pathname === "/install" &&
+      (this.auth.isAuthorized(req, this.allowLocalhostBypass) ||
+        (this.allowLocalhostBypass && this.auth.isPrivateLanOrLocalIp(clientIp)))
+    ) {
+      const actualPort = this.getPort();
+      const { lanUrls, tailscaleUrls } = AuthManager.getNetworkUrls(actualPort);
+      const wanStatus = this.wan.getStatus(tailscaleUrls);
+      const lanBase = lanUrls[0] || `http://${req.headers.host || "localhost:4321"}`;
+      const wanBase = wanStatus.publicUrl || tailscaleUrls[0] || "";
+      const tok = this.auth.token;
+      const deepLink = `remoteagent://pair?lan=${encodeURIComponent(lanBase)}&wan=${encodeURIComponent(
+        wanBase
+      )}&token=${encodeURIComponent(tok)}`;
+      const webLink = `/?token=${encodeURIComponent(tok)}`;
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Install Copilot Remote Agent</title><style>body{margin:0;padding:24px 16px;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}.card{max-width:460px;margin:0 auto;background:#161b22;border:1px solid #30363d;border-radius:14px;padding:22px 18px;}h2{margin:0 0 8px;font-size:20px;}p{margin:0 0 18px;font-size:13.5px;color:#8b949e;line-height:1.45;}a.btn{display:block;text-decoration:none;text-align:center;padding:13px 16px;border-radius:10px;font-weight:600;font-size:14.5px;margin-bottom:12px;}.btn-green{background:#238636;color:#fff;}.btn-blue{background:#1f6feb;color:#fff;}.btn-sec{background:#21262d;color:#e6edf3;border:1px solid #30363d;}.meta{font-size:11.5px;color:#8b949e;margin-top:14px;word-break:break-all;}</style></head><body><div class="card"><h2>Copilot Remote Agent</h2><p>Download the pre-paired Android APK or tap below to auto-configure your installed app.</p><a class="btn btn-green" href="/apk">⬇ Download Pre-Paired Android APK</a><a class="btn btn-blue" href="${deepLink}">⚡ 1-Tap Auto-Pair Installed App</a><a class="btn btn-sec" href="${webLink}">🌐 Open Web Companion in Browser</a><div class="meta">LAN: ${lanBase}${
+        wanBase ? `<br/>WAN: ${wanBase}` : ""
+      }</div></div></body></html>`;
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end(html);
+      return;
+    }
+
     // Serve downloadable Android APK & Windows Desktop Installer under /download/*
     if (pathname.startsWith("/download/")) {
-      if (!this.auth.isAuthorized(req, this.allowLocalhostBypass)) {
+      const isLanAllowed =
+        this.allowLocalhostBypass && this.auth.isPrivateLanOrLocalIp(clientIp);
+      if (!this.auth.isAuthorized(req, this.allowLocalhostBypass) && !isLanAllowed) {
         this.sendJson(res, 401, { error: "Unauthorized download request" });
         return;
       }
       const fileName = path.basename(pathname);
-      const releaseFile = path.join(RELEASES_DIR, fileName);
+      const pairedApk = path.join(os.homedir(), ".copilot", "RemoteAgent-paired.apk");
+      const releaseFile =
+        fileName === "RemoteAgent-android.apk" &&
+        fs.existsSync(pairedApk) &&
+        fs.statSync(pairedApk).isFile()
+          ? pairedApk
+          : path.join(RELEASES_DIR, fileName);
       if (!fs.existsSync(releaseFile) || !fs.statSync(releaseFile).isFile()) {
         this.sendJson(res, 404, { error: `Release binary ${fileName} not found` });
         return;
