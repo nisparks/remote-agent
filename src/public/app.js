@@ -73,8 +73,9 @@ const state = {
   currentDocArtifact: null,
 };
 
-// --- Token & API Helpers ---
+  // Token & API Helpers
 async function initTokenFromUrl() {
+  const existingToken = (localStorage.getItem("ra_token") || "").trim();
   const params = new URLSearchParams(window.location.search);
   const urlToken = (params.get("token") || "").trim();
   if (urlToken) {
@@ -95,7 +96,42 @@ async function initTokenFromUrl() {
         if (r.ok && d.token) {
           localStorage.setItem("ra_token", d.token);
           state.token = d.token;
+          if (window.AndroidNative && typeof window.AndroidNative.syncEndpoints === "function") {
+            const lan = localStorage.getItem("ra_lan_url") || "";
+            const wan = localStorage.getItem("ra_wan_url") || "";
+            window.AndroidNative.syncEndpoints(lan, wan, d.token);
+          }
           return;
+        }
+      } catch {}
+      // If the 6-digit code in the URL was expired from an earlier launch, keep any existing valid token!
+      if (existingToken) {
+        state.token = existingToken;
+        return;
+      }
+    }
+
+    // If localStorage already has a different token (e.g. a 30-day tmp_ token), check if urlToken is actually valid before overwriting
+    if (existingToken && existingToken !== urlToken) {
+      try {
+        const checkUrl = await fetch("/api/health", {
+          headers: { Authorization: `Bearer ${urlToken}` },
+        });
+        const checkData = await checkUrl.json();
+        if (!checkData.authenticated) {
+          const checkExisting = await fetch("/api/health", {
+            headers: { Authorization: `Bearer ${existingToken}` },
+          });
+          const existingData = await checkExisting.json();
+          if (existingData.authenticated) {
+            state.token = existingToken;
+            if (window.AndroidNative && typeof window.AndroidNative.syncEndpoints === "function") {
+              const lan = localStorage.getItem("ra_lan_url") || "";
+              const wan = localStorage.getItem("ra_wan_url") || "";
+              window.AndroidNative.syncEndpoints(lan, wan, existingToken);
+            }
+            return;
+          }
         }
       } catch {}
     }
@@ -103,7 +139,7 @@ async function initTokenFromUrl() {
     localStorage.setItem("ra_token", urlToken);
     state.token = urlToken;
   } else {
-    state.token = localStorage.getItem("ra_token") || "";
+    state.token = existingToken;
   }
 }
 
@@ -651,7 +687,7 @@ async function loadHostStatus() {
     if (lan) localStorage.setItem("ra_lan_url", lan);
     if (wan) localStorage.setItem("ra_wan_url", wan);
     if (window.AndroidNative && typeof window.AndroidNative.syncEndpoints === "function") {
-      window.AndroidNative.syncEndpoints(wan || lan, wan, state.token || "");
+      window.AndroidNative.syncEndpoints(lan, wan, state.token || "");
     }
   } catch {}
 }
@@ -3758,6 +3794,11 @@ function setupEventListeners() {
       const effectiveToken = data.token || val;
       state.token = effectiveToken;
       localStorage.setItem("ra_token", effectiveToken);
+      if (window.AndroidNative && typeof window.AndroidNative.syncEndpoints === "function") {
+        const lan = localStorage.getItem("ra_lan_url") || "";
+        const wan = localStorage.getItem("ra_wan_url") || "";
+        window.AndroidNative.syncEndpoints(lan, wan, effectiveToken);
+      }
       document.getElementById("qrModal")?.classList.remove("open");
       await loadHostStatus();
       await loadSessionsList(true);

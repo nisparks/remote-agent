@@ -450,7 +450,10 @@ public class MainActivity extends Activity {
             SharedPreferences.Editor ed = prefs.edit();
             if (lanUrl != null) ed.putString(KEY_LAN_URL, lanUrl.trim());
             if (wanUrl != null) ed.putString(KEY_WAN_URL, wanUrl.trim());
-            if (token != null) ed.putString(KEY_TOKEN, token.trim());
+            // Do not overwrite KEY_TOKEN with a 30-second 6-digit MFA code; initTokenFromUrl() will sync the exchanged 30-day token via syncEndpoints()
+            if (token != null && !token.trim().matches("^\\d{6}$")) {
+                ed.putString(KEY_TOKEN, token.trim());
+            }
             ed.apply();
         }
 

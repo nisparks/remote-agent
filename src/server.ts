@@ -578,12 +578,12 @@ export class RemoteAgentServer {
       }>(req, 8 * 1024); // Strict 8KB body limit on unauthenticated auth endpoint
       const candidate = (body.token || "").trim();
 
-      if (candidate && candidate === this.auth.token) {
+      if (candidate && this.auth.isTokenStringAuthorized(candidate)) {
         this.auth.clearFailedAttempts(clientIp);
         this.sendJson(
           res,
           200,
-          { ok: true, token: candidate, isTempSession: false },
+          { ok: true, token: candidate, isTempSession: candidate !== this.auth.token },
           {
             "Set-Cookie": `ra_token=${encodeURIComponent(candidate)}; Path=/; SameSite=Lax; Max-Age=2592000`,
           }

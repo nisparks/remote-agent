@@ -457,6 +457,15 @@ export class AuthManager {
     return null;
   }
 
+  isTokenStringAuthorized(candidate: string): boolean {
+    if (!candidate) return false;
+    this.pruneExpiredTempSessions();
+    const a = Buffer.from(candidate);
+    const b = Buffer.from(this.config.pairingToken);
+    const isMasterMatch = a.length === b.length && crypto.timingSafeEqual(a, b);
+    return isMasterMatch || this.tempSessions.has(candidate);
+  }
+
   isAuthorized(req: IncomingMessage, allowLocalhostBypass = true): boolean {
     if (allowLocalhostBypass && this.isLoopbackRequest(req)) {
       return true;
