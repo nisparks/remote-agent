@@ -179,7 +179,7 @@ async function apiFetch(path, options = {}) {
   }
   const res = await fetch(routedPath, { ...options, headers });
   if (res.status === 401) {
-    openQrModal();
+    openQrModal(true);
     throw new Error("Unauthorized — please scan the pairing QR code or enter your token.");
   }
   const data = await res.json();
@@ -3649,7 +3649,41 @@ async function refreshQrModalInfo() {
   }
 }
 
-async function openQrModal() {
+let authRecoveryTimer = null;
+
+function startAutoAuthRecoveryLoop() {
+  if (authRecoveryTimer) return;
+  authRecoveryTimer = setInterval(async () => {
+    try {
+      // Also check if AndroidNative has a saved master token
+      if (!state.token && window.AndroidNative && typeof window.AndroidNative.getSavedToken === "function") {
+        const nativeTok = (window.AndroidNative.getSavedToken() || "").trim();
+        if (nativeTok) {
+          state.token = nativeTok;
+          localStorage.setItem("ra_token", nativeTok);
+        }
+      }
+      const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+      const r = await fetch("/api/health", { headers });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.authenticated) {
+        clearInterval(authRecoveryTimer);
+        authRecoveryTimer = null;
+        document.getElementById("qrModal")?.classList.remove("open");
+        connectWebSocket();
+        await Promise.all([loadHostStatus(), loadSessionsList(true)]);
+        if (state.activeSessionId) {
+          loadSessionDetail(state.activeSessionId, true);
+        }
+      }
+    } catch {
+      // Keep polling quietly until network or server recovers
+    }
+  }, 2500);
+}
+
+async function openQrModal(isUnauthenticated = false) {
   const modal = document.getElementById("qrModal");
   if (!modal) return;
   const alreadyOpen = modal.classList.contains("open");
@@ -3657,9 +3691,13 @@ async function openQrModal() {
     modal.classList.add("open");
     pushOverlayHistory("qrModal");
     const inputEl = document.getElementById("manualTokenInput");
-    if (inputEl && document.activeElement !== inputEl && !inputEl.value) {
+    // Only prefill manualTokenInput if already authenticated; never prefill a rejected/expired token!
+    if (inputEl && document.activeElement !== inputEl && !inputEl.value && !isUnauthenticated) {
       inputEl.value = state.token || "";
     }
+  }
+  if (isUnauthenticated) {
+    startAutoAuthRecoveryLoop();
   }
   if (state.token || !alreadyOpen) {
     await refreshQrModalInfo();
@@ -4355,11 +4393,13 @@ async function init() {
     if (healthRes.ok) {
       const health = await healthRes.json();
       if (!health.authenticated) {
-        await openQrModal();
+        await openQrModal(true);
         return;
       }
     }
-  } catch {}
+  } catch {
+    startAutoAuthRecoveryLoop();
+  }
 
   connectWebSocket();
   await Promise.all([loadHostStatus(), loadSessionsList(true)]);

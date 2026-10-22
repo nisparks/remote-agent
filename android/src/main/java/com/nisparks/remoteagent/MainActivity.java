@@ -306,7 +306,7 @@ public class MainActivity extends Activity {
     private boolean probeEndpoint(String baseUrl) {
         HttpURLConnection conn = null;
         try {
-            String clean = baseUrl.replaceAll("/+$", "");
+            String clean = normalizeEndpointUrl(baseUrl).split("\\?")[0].replaceAll("/+$", "");
             URL url = new URL(clean + "/api/health");
             conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(2200);
@@ -408,6 +408,7 @@ public class MainActivity extends Activity {
                 + "function connLan(){var c=parseAndSave();showSt('Connecting to LAN...');AndroidNative.connectTo(c.l,c.t);}"
                 + "function connWan(){var c=parseAndSave();showSt('Connecting to HTTPS WAN...');AndroidNative.connectTo(c.w||c.l,c.t);}"
                 + "function autoConn(){parseAndSave();showSt('Probing LAN & WAN endpoints...');AndroidNative.autoConnect();}"
+                + "setInterval(function(){if(document.activeElement&&document.activeElement.tagName==='INPUT')return;AndroidNative.silentAutoRecover();},4000);"
                 + "</script></body></html>";
 
         webView.loadDataWithBaseURL("http://localhost/", html, "text/html", "UTF-8", null);
@@ -495,8 +496,47 @@ public class MainActivity extends Activity {
                 ed.putString(KEY_WAN_URL, wanUrl.trim());
                 ed.putString(KEY_LAST_GOOD_URL, wanUrl.trim());
             }
-            if (token != null && !token.isEmpty()) ed.putString(KEY_TOKEN, token.trim());
+            if (token != null && !token.isEmpty()) {
+                String cleanTok = token.trim();
+                String existingTok = prefs.getString(KEY_TOKEN, "");
+                // Never overwrite a permanent master pairing token with a temporary tmp_ token
+                if (existingTok == null || existingTok.isEmpty() || existingTok.startsWith("tmp_") || !cleanTok.startsWith("tmp_")) {
+                    ed.putString(KEY_TOKEN, cleanTok);
+                }
+            }
             ed.apply();
+        }
+
+        @JavascriptInterface
+        public String getSavedToken() {
+            return prefs.getString(KEY_TOKEN, "");
+        }
+
+        @JavascriptInterface
+        public void silentAutoRecover() {
+            final String lanUrl = prefs.getString(KEY_LAN_URL, "");
+            final String wanUrl = prefs.getString(KEY_WAN_URL, "");
+            final String token = prefs.getString(KEY_TOKEN, "");
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    String chosen = null;
+                    if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
+                        chosen = lanUrl;
+                    } else if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
+                        chosen = wanUrl;
+                    }
+                    final String target = chosen;
+                    if (target != null) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                loadEndpointWithToken(target, token);
+                            }
+                        });
+                    }
+                }
+            }).start();
         }
 
         @JavascriptInterface

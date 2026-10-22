@@ -321,10 +321,11 @@
           <div style="display: flex; gap: 6px; flex-wrap: wrap;">
             <input id="manualTokenInput" type="text" class="search-input" style="flex: 1; min-width: 150px;" placeholder="6-digit MFA code (e.g. 482910) or token..." />
             <select id="tempLeaseDurationSelect" class="mode-select" title="Session Lease Duration">
-              <option value="1">1 Hour</option>
-              <option value="8" selected>8 Hours (Workday)</option>
+              <option value="87600" selected>Permanent (Trusted Device)</option>
+              <option value="720">30 Days</option>
               <option value="24">24 Hours</option>
-              <option value="720">30 Days (Trusted)</option>
+              <option value="8">8 Hours (Workday)</option>
+              <option value="1">1 Hour</option>
             </select>
             <button id="saveTokenBtn" class="btn btn-sm btn-primary">Connect</button>
           </div>
