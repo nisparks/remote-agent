@@ -366,11 +366,45 @@ public class MainActivity extends Activity {
         return new java.util.ArrayList<String>(set);
     }
 
+    // Probes all candidates in parallel; returns the highest-priority (list order) reachable one,
+    // so dead LAN addresses never delay a working WAN route.
     private String findReachableEndpoint(String lanUrl, String wanUrl) {
-        for (String candidate : candidateEndpoints(lanUrl, wanUrl)) {
-            if (probeEndpoint(candidate)) return candidate;
+        final java.util.List<String> candidates = candidateEndpoints(lanUrl, wanUrl);
+        final int n = candidates.size();
+        if (n == 0) return null;
+        final int[] results = new int[n]; // 0 = pending, 1 = ok, -1 = failed
+        for (int i = 0; i < n; i++) {
+            final int idx = i;
+            final String candidate = candidates.get(i);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    boolean ok = probeEndpoint(candidate);
+                    synchronized (results) {
+                        results[idx] = ok ? 1 : -1;
+                        results.notifyAll();
+                    }
+                }
+            }).start();
         }
-        return null;
+        long deadline = System.currentTimeMillis() + 20000;
+        synchronized (results) {
+            while (true) {
+                for (int i = 0; i < n; i++) {
+                    if (results[i] == 1) return candidates.get(i);
+                    if (results[i] == 0) break;
+                }
+                boolean allDone = true;
+                for (int r : results) if (r == 0) { allDone = false; break; }
+                long remaining = deadline - System.currentTimeMillis();
+                if (allDone || remaining <= 0) return null;
+                try {
+                    results.wait(remaining);
+                } catch (InterruptedException e) {
+                    return null;
+                }
+            }
+        }
     }
 
     private void startConnectionWatchdog() {
@@ -380,9 +414,14 @@ public class MainActivity extends Activity {
             private int consecutiveMisses = 0;
             private int backoffSeconds = 5;
             private long lastTryMs = 0;
+            private final java.util.concurrent.atomic.AtomicBoolean probing = new java.util.concurrent.atomic.AtomicBoolean(false);
             @Override
             public void run() {
                 final long now = System.currentTimeMillis();
+                if (probing.get()) {
+                    reconnectHandler.postDelayed(this, 1000);
+                    return;
+                }
                 final String currentUrl = webView != null ? webView.getUrl() : null;
                 final String lanUrl = prefs.getString(KEY_LAN_URL, "");
                 final String wanUrl = prefs.getString(KEY_WAN_URL, "");
@@ -393,9 +432,11 @@ public class MainActivity extends Activity {
                     return;
                 }
                 lastTryMs = now;
+                probing.set(true);
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
+                      try {
                         String target = null;
                         String active = currentUrl != null ? currentUrl : lastGood;
                         if (active != null && !active.isEmpty() && !active.startsWith("http://localhost")) {
@@ -443,6 +484,9 @@ public class MainActivity extends Activity {
                                 }
                             });
                         }
+                      } finally {
+                        probing.set(false);
+                      }
                     }
                 }).start();
                 reconnectHandler.postDelayed(this, 1000 * backoffSeconds);
@@ -461,8 +505,10 @@ public class MainActivity extends Activity {
                     : clean + "/api/health";
             URL url = new URL(urlWithToken);
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(2200);
-            conn.setReadTimeout(2200);
+            // LAN (http) should answer fast; WAN (https over cellular) needs time for DNS + TLS.
+            int timeoutMs = clean.startsWith("https://") ? 8000 : 2500;
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
             conn.setRequestMethod("GET");
             int code = conn.getResponseCode();
             if (code < 200 || code >= 400) return false;

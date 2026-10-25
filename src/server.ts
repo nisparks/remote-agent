@@ -31,6 +31,8 @@ export interface RemoteAgentServerOptions {
   customToken?: string;
   allowLocalhostBypass?: boolean;
   enableWanAutoStart?: boolean;
+  /** WAN access log path; null disables. Defaults to ~/.copilot/remote-agent-access.log unless port is 0 (tests). */
+  accessLogPath?: string | null;
 }
 
 export class RemoteAgentServer {
@@ -61,12 +63,19 @@ export class RemoteAgentServer {
   private host: string;
   private allowLocalhostBypass: boolean;
   private enableWanAutoStart: boolean;
+  private accessLogPath: string | null;
 
   constructor(options: RemoteAgentServerOptions = {}) {
     this.port = options.port ?? Number(process.env.PORT || 4321);
     this.host = options.host ?? (process.env.HOST || "0.0.0.0");
     this.allowLocalhostBypass = options.allowLocalhostBypass ?? true;
     this.enableWanAutoStart = options.enableWanAutoStart ?? true;
+    this.accessLogPath =
+      options.accessLogPath !== undefined
+        ? options.accessLogPath
+        : this.port === 0
+          ? null
+          : path.join(os.homedir(), ".copilot", "remote-agent-access.log");
 
     this.auth = new AuthManager(options.customToken);
     this.store = new SessionStateStore();
@@ -512,9 +521,9 @@ export class RemoteAgentServer {
   }
 
   private appendWanLog(clientIp: string, line: string): void {
-    if (this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    const logPath = this.accessLogPath;
+    if (!logPath || this.auth.isPrivateLanOrLocalIp(clientIp)) return;
     try {
-      const logPath = path.join(os.homedir(), ".copilot", "remote-agent-access.log");
       try {
         if (fs.statSync(logPath).size > 1_000_000) fs.renameSync(logPath, `${logPath}.1`);
       } catch {}
@@ -524,7 +533,7 @@ export class RemoteAgentServer {
 
   // Records non-LAN requests (no query strings/tokens) to help diagnose WAN connectivity.
   private logWanAccess(req: http.IncomingMessage, res: http.ServerResponse, clientIp: string, pathname: string): void {
-    if (this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    if (!this.accessLogPath || this.auth.isPrivateLanOrLocalIp(clientIp)) return;
     const started = Date.now();
     res.on("finish", () => {
       const authed = this.auth.isAuthorized(req, false) ? "auth" : "anon";
