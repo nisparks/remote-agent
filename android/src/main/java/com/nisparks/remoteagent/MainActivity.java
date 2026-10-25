@@ -26,9 +26,12 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.os.Handler;
 
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "RemoteAgentPrefs";
@@ -43,6 +46,11 @@ public class MainActivity extends Activity {
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
     private SharedPreferences prefs;
+    private final Handler reconnectHandler = new Handler();
+    private Runnable reconnectWatchdog;
+    private volatile boolean mainFrameError = false;
+    private boolean reconnectWatchdogRunning = false;
+    private String lastConnectionProbeTarget = "";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -70,6 +78,7 @@ public class MainActivity extends Activity {
 
         setContentView(root);
         connectImmediateOrAuto();
+        startConnectionWatchdog();
     }
 
     @Override
@@ -85,7 +94,17 @@ public class MainActivity extends Activity {
         super.onResume();
         if (webView != null) {
             webView.evaluateJavascript("if(window.__onAppResume) window.__onAppResume();", null);
+            webView.evaluateJavascript(
+                    "(function(){ if(window.ensureLiveConnectionOnWake) window.ensureLiveConnectionOnWake(); })()",
+                    null
+            );
         }
+        reconnectHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                connectImmediateOrAuto();
+            }
+        }, 500);
     }
 
     private void initDefaultsIfEmpty() {
@@ -202,9 +221,15 @@ public class MainActivity extends Activity {
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                mainFrameError = false;
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                if (url != null && (url.startsWith("http://") || url.startsWith("https://")) && !url.startsWith("http://localhost")) {
+                if (!mainFrameError && url != null && (url.startsWith("http://") || url.startsWith("https://")) && !url.startsWith("http://localhost")) {
                     String base = url.split("\\?")[0].replaceAll("/+$", "");
                     prefs.edit().putString(KEY_LAST_GOOD_URL, base).apply();
                 }
@@ -213,19 +238,32 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request != null && request.isForMainFrame()) {
+                    mainFrameError = true;
                     String failedUrl = request.getUrl() != null ? request.getUrl().toString() : "";
-                    String wanUrl = prefs.getString(KEY_WAN_URL, "");
-                    String lanUrl = prefs.getString(KEY_LAN_URL, "");
-                    String token = prefs.getString(KEY_TOKEN, "");
+                    final String wanUrl = prefs.getString(KEY_WAN_URL, "");
+                    final String lanUrl = prefs.getString(KEY_LAN_URL, "");
+                    final String token = prefs.getString(KEY_TOKEN, "");
                     if (wanUrl != null && !wanUrl.isEmpty() && !failedUrl.startsWith(wanUrl)) {
-                        loadEndpointWithToken(wanUrl, token);
-                        return;
+                        reconnectHandler.postDelayed(new Runnable() {
+                            @Override public void run() { loadEndpointWithToken(wanUrl, token); }
+                        }, 750);
+                    } else if (lanUrl != null && !lanUrl.isEmpty() && !failedUrl.startsWith(lanUrl)) {
+                        reconnectHandler.postDelayed(new Runnable() {
+                            @Override public void run() { loadEndpointWithToken(lanUrl, token); }
+                        }, 750);
+                    } else {
+                        new Thread(new Runnable() {
+                            @Override public void run() {
+                                try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+                                final String target = findReachableEndpoint(lanUrl, wanUrl);
+                                if (target != null) {
+                                    runOnUiThread(new Runnable() {
+                                        @Override public void run() { loadEndpointWithToken(target, token); }
+                                    });
+                                }
+                            }
+                        }).start();
                     }
-                    if (lanUrl != null && !lanUrl.isEmpty() && !failedUrl.startsWith(lanUrl)) {
-                        loadEndpointWithToken(lanUrl, token);
-                        return;
-                    }
-                    showConnectionManagerHtml();
                 }
             }
         });
@@ -303,17 +341,122 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    private String findReachableEndpoint(String lanUrl, String wanUrl) {
+        if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
+            return lanUrl;
+        }
+        if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
+            return wanUrl;
+        }
+        return null;
+    }
+
+    private void startConnectionWatchdog() {
+        if (reconnectWatchdogRunning) return;
+        reconnectWatchdogRunning = true;
+        reconnectWatchdog = new Runnable() {
+            private int consecutiveMisses = 0;
+            private int backoffSeconds = 5;
+            private long lastTryMs = 0;
+            @Override
+            public void run() {
+                final long now = System.currentTimeMillis();
+                final String currentUrl = webView != null ? webView.getUrl() : null;
+                final String lanUrl = prefs.getString(KEY_LAN_URL, "");
+                final String wanUrl = prefs.getString(KEY_WAN_URL, "");
+                final String lastGood = prefs.getString(KEY_LAST_GOOD_URL, "");
+                final String token = prefs.getString(KEY_TOKEN, "");
+                if (now - lastTryMs < 1000 * backoffSeconds) {
+                    reconnectHandler.postDelayed(this, 1000 * backoffSeconds);
+                    return;
+                }
+                lastTryMs = now;
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        String target = null;
+                        String active = currentUrl != null ? currentUrl : lastGood;
+                        if (active != null && !active.isEmpty() && !active.startsWith("http://localhost")) {
+                            String activeBase = active.split("\\?")[0].replaceAll("/+$", "");
+                            if (probeEndpoint(activeBase)) {
+                                target = activeBase;
+                                consecutiveMisses = 0;
+                                backoffSeconds = 5;
+                            }
+                        }
+                        if (target == null) {
+                            target = findReachableEndpoint(lanUrl, wanUrl);
+                            if (target == null) {
+                                consecutiveMisses++;
+                                backoffSeconds = Math.min(60, 5 * (1 << Math.min(3, consecutiveMisses)));
+                            } else {
+                                consecutiveMisses = 0;
+                                backoffSeconds = 5;
+                            }
+                        }
+                        if (target != null) {
+                            final String chosenTarget = target;
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    String currentBase = webView.getUrl() != null
+                                            ? webView.getUrl().split("\\?")[0].replaceAll("/+$", "")
+                                            : "";
+                                    if (mainFrameError || !chosenTarget.replaceAll("/+$", "").equals(currentBase)) {
+                                        prefs.edit().putString(KEY_LAST_GOOD_URL, chosenTarget).apply();
+                                        loadEndpointWithToken(chosenTarget, token);
+                                    } else {
+                                        webView.evaluateJavascript(
+                                                "(function(){ if(window.AndroidNative && window.AndroidNative.getSavedToken) return true; return false; })()",
+                                                null
+                                        );
+                                    }
+                                }
+                            });
+                        } else if (currentUrl == null || !currentUrl.startsWith("http://localhost")) {
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    showConnectionManagerHtml();
+                                }
+                            });
+                        }
+                    }
+                }).start();
+                reconnectHandler.postDelayed(this, 1000 * backoffSeconds);
+            }
+        };
+        reconnectHandler.post(reconnectWatchdog);
+    }
+
     private boolean probeEndpoint(String baseUrl) {
         HttpURLConnection conn = null;
         try {
             String clean = normalizeEndpointUrl(baseUrl).split("\\?")[0].replaceAll("/+$", "");
-            URL url = new URL(clean + "/api/health");
+            String token = prefs.getString(KEY_TOKEN, "");
+            String urlWithToken = token != null && !token.isEmpty()
+                    ? clean + "/api/health?token=" + Uri.encode(token)
+                    : clean + "/api/health";
+            URL url = new URL(urlWithToken);
             conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(2200);
             conn.setReadTimeout(2200);
             conn.setRequestMethod("GET");
             int code = conn.getResponseCode();
-            return code >= 200 && code < 500;
+            if (code < 200 || code >= 400) return false;
+            BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    conn.getInputStream(),
+                    java.nio.charset.StandardCharsets.UTF_8
+            ));
+            StringBuilder body = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) body.append(line);
+            reader.close();
+            String json = body.toString();
+            if (token != null && !token.isEmpty()) {
+                return json.contains("\"authenticated\":true");
+            }
+            return json.contains("\"ok\":true");
         } catch (Exception e) {
             return false;
         } finally {

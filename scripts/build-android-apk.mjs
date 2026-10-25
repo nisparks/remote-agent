@@ -34,7 +34,7 @@ function getLanUrl() {
       if (addr.family !== "IPv4" || addr.internal) continue;
       const lower = name.toLowerCase();
       if (lower.includes("wsl") || lower.includes("vethernet") || lower.includes("docker")) continue;
-      if (!addr.address.startsWith("100.")) {
+      if (!addr.address.startsWith("100.") && !addr.address.startsWith("169.254.")) {
         return `http://${addr.address}:4321`;
       }
     }

@@ -305,7 +305,7 @@ export class AuthManager {
 
   issueTempSession(params: { label?: string; clientIp: string; durationHours?: number }): TempSessionGrant {
     this.pruneExpiredTempSessions();
-    const hours = Math.max(0.25, Math.min(24 * 30, Number(params.durationHours || 8)));
+    const hours = Math.max(0.25, Math.min(24 * 3650, Number(params.durationHours || 8)));
     const now = Date.now();
     const grant: TempSessionGrant = {
       id: `sess-${crypto.randomBytes(6).toString("hex")}`,
@@ -468,27 +468,6 @@ export class AuthManager {
     return null;
   }
 
-  private tryAutoHealDeviceToken(candidate: string, clientIp = "any"): boolean {
-    if (this.isEphemeralTestAuth) return false;
-    if (this.revokedTokens.has(candidate)) return false;
-    // Recognize previously issued tmp_ tokens or 32-char base64url pairing tokens held by an already-paired phone/device
-    if (/^tmp_[A-Za-z0-9_-]{22,36}$/.test(candidate) || /^[A-Za-z0-9_-]{32}$/.test(candidate)) {
-      const now = Date.now();
-      const grant: TempSessionGrant = {
-        id: `sess-recovered-${crypto.createHash("sha1").update(candidate).digest("hex").slice(0, 10)}`,
-        token: candidate,
-        label: "Auto-Recovered Paired Device",
-        clientIp,
-        createdAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + 3650 * 24 * 3600_000).toISOString(),
-      };
-      this.tempSessions.set(candidate, grant);
-      this.saveConfig();
-      return true;
-    }
-    return false;
-  }
-
   isTokenStringAuthorized(candidate: string, clientIp = "any"): boolean {
     if (!candidate) return false;
     this.pruneExpiredTempSessions();
@@ -498,7 +477,7 @@ export class AuthManager {
     if (isMasterMatch || this.tempSessions.has(candidate)) {
       return true;
     }
-    return this.tryAutoHealDeviceToken(candidate, clientIp);
+    return false;
   }
 
   isAuthorized(req: IncomingMessage, allowLocalhostBypass = true): boolean {
@@ -528,6 +507,7 @@ export class AuthManager {
     for (const [name, addrs] of Object.entries(nets)) {
       for (const addr of addrs || []) {
         if (addr.family !== "IPv4" || addr.internal) continue;
+        if (addr.address.startsWith("169.254.")) continue;
         const lowerName = name.toLowerCase();
         const isVirtualSwitch =
           lowerName.includes("wsl") ||
@@ -547,7 +527,7 @@ export class AuthManager {
     if (lanUrls.length === 0) {
       for (const addrs of Object.values(nets)) {
         for (const addr of addrs || []) {
-          if (addr.family === "IPv4" && !addr.internal && !addr.address.startsWith("100.")) {
+          if (addr.family === "IPv4" && !addr.internal && !addr.address.startsWith("100.") && !addr.address.startsWith("169.254.")) {
             lanUrls.push(`http://${addr.address}:${port}`);
           }
         }

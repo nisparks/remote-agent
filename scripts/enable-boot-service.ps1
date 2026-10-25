@@ -11,7 +11,10 @@ $user = "$env:USERDOMAIN\$env:USERNAME"
 
 Write-Host "Registering Pre-Login OS Boot Task (CopilotRemoteAgent-BootServer) for $user..." -ForegroundColor Cyan
 
-$action = New-ScheduledTaskAction -Execute $nodeExe -Argument "dist\server.js --port=4321" -WorkingDirectory $RepoRoot
+$watchScript = Join-Path $RepoRoot "scripts\watch-remote-agent.ps1"
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$watchScript`" -RepoRoot `"$RepoRoot`"" `
+  -WorkingDirectory $RepoRoot
 $triggerBoot = New-ScheduledTaskTrigger -AtStartup
 $triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest

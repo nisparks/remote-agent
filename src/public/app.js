@@ -364,8 +364,17 @@ function formatFullMessageTimestamp(iso) {
 
 // --- WebSocket Live Connection & Persistent Heartbeat ---
 let wsHeartbeatTimer = null;
+let wsReconnectTimer = null;
+let wsReconnectAttempt = 0;
+let wsHeartbeatTimeoutTimer = null;
 
 function connectWebSocket() {
+  if (
+    state.ws &&
+    (state.ws.readyState === WebSocket.CONNECTING || state.ws.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
   if (state.ws) {
     try {
       state.ws.close();
@@ -381,11 +390,18 @@ function connectWebSocket() {
   state.ws = ws;
 
   ws.onopen = () => {
+    wsReconnectAttempt = 0;
     updateHostBanner();
     wsHeartbeatTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(JSON.stringify({ type: "ping" }));
+          if (wsHeartbeatTimeoutTimer) clearTimeout(wsHeartbeatTimeoutTimer);
+          wsHeartbeatTimeoutTimer = setTimeout(() => {
+            if (state.ws === ws && ws.readyState === WebSocket.OPEN) {
+              ws.close(4000, "Heartbeat timeout");
+            }
+          }, 12_000);
         } catch {}
       }
     }, 15000);
@@ -394,6 +410,12 @@ function connectWebSocket() {
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
+      if (msg.type === "pong") {
+        if (wsHeartbeatTimeoutTimer) {
+          clearTimeout(wsHeartbeatTimeoutTimer);
+          wsHeartbeatTimeoutTimer = null;
+        }
+      }
       handleLiveWsMessage(msg);
     } catch {}
   };
@@ -403,7 +425,14 @@ function connectWebSocket() {
       clearInterval(wsHeartbeatTimer);
       wsHeartbeatTimer = null;
     }
-    setTimeout(async () => {
+    if (wsHeartbeatTimeoutTimer) {
+      clearTimeout(wsHeartbeatTimeoutTimer);
+      wsHeartbeatTimeoutTimer = null;
+    }
+    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(async () => {
+      wsReconnectAttempt = Math.min(wsReconnectAttempt + 1, 6);
+      const reconnectDelay = Math.min(30000, 1000 * (2 ** wsReconnectAttempt));
       // If we were on a LAN IP and Wi-Fi was turned off (switched to 5G/WAN), auto-failover to WAN URL!
       const isPrivateLanHost = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(
         window.location.hostname
@@ -434,7 +463,10 @@ function connectWebSocket() {
         }
       }
       connectWebSocket();
-    }, 2500);
+      wsReconnectTimer = setTimeout(() => {
+        connectWebSocket();
+      }, reconnectDelay);
+    }, 1000);
   };
 }
 
@@ -611,7 +643,7 @@ function ensureLiveConnectionOnWake() {
   }
   loadHostStatus();
   if (state.activeSessionId) {
-    loadSessionDetail(state.activeSessionId, false);
+    loadSessionDetail(state.activeSessionId, true);
   }
 }
 
