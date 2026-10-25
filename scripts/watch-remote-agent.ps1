@@ -11,15 +11,20 @@ if (-not $nodeExe) {
 
 while ($true) {
   $healthy = $false
-  try {
-    $response = Invoke-WebRequest `
-      -Uri "http://127.0.0.1:4321/api/health" `
-      -UseBasicParsing `
-      -TimeoutSec 4 `
-      -ErrorAction Stop
-    $healthy = $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
-  } catch {
-    $healthy = $false
+  $restartFlag = Join-Path $env:USERPROFILE ".copilot\remote-agent-restart"
+  if (Test-Path $restartFlag) {
+    Remove-Item $restartFlag -Force -ErrorAction SilentlyContinue
+  } else {
+    try {
+      $response = Invoke-WebRequest `
+        -Uri "http://127.0.0.1:4321/api/health" `
+        -UseBasicParsing `
+        -TimeoutSec 4 `
+        -ErrorAction Stop
+      $healthy = $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
+    } catch {
+      $healthy = $false
+    }
   }
 
   if (-not $healthy) {

@@ -219,12 +219,17 @@ export class RemoteAgentServer {
       }
 
       if (!this.auth.isAuthorized(req, this.allowLocalhostBypass)) {
+        this.appendWanLog(this.auth.getClientIp(req), "WS /ws 401");
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
       }
 
       this.wss.handleUpgrade(req, socket, head, (ws) => {
+        const wsIp = this.auth.getClientIp(req);
+        const wsStarted = Date.now();
+        this.appendWanLog(wsIp, "WS /ws open");
+        ws.on("close", (code) => this.appendWanLog(wsIp, `WS /ws close code=${code} after ${Math.round((Date.now() - wsStarted) / 1000)}s`));
         this.clients.add(ws);
         ws.send(
           JSON.stringify({
@@ -506,12 +511,35 @@ export class RemoteAgentServer {
     };
   }
 
+  private appendWanLog(clientIp: string, line: string): void {
+    if (this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    try {
+      const logPath = path.join(os.homedir(), ".copilot", "remote-agent-access.log");
+      try {
+        if (fs.statSync(logPath).size > 1_000_000) fs.renameSync(logPath, `${logPath}.1`);
+      } catch {}
+      fs.appendFileSync(logPath, `${new Date().toISOString()} ${clientIp} ${line}\n`);
+    } catch {}
+  }
+
+  // Records non-LAN requests (no query strings/tokens) to help diagnose WAN connectivity.
+  private logWanAccess(req: http.IncomingMessage, res: http.ServerResponse, clientIp: string, pathname: string): void {
+    if (this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    const started = Date.now();
+    res.on("finish", () => {
+      const authed = this.auth.isAuthorized(req, false) ? "auth" : "anon";
+      const ua = String(req.headers["user-agent"] || "").slice(0, 60);
+      this.appendWanLog(clientIp, `${req.method} ${pathname} ${res.statusCode} ${Date.now() - started}ms ${authed} ${ua}`);
+    });
+  }
+
   private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const method = req.method || "GET";
     const parsedUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = parsedUrl.pathname;
     const clientIp = this.auth.getClientIp(req);
     const userAgent = String(req.headers["user-agent"] || "");
+    this.logWanAccess(req, res, clientIp, pathname);
 
     // 1. Bot/Vulnerability Scanner Honeypot Trap (never blocks already-authenticated devices or static UI loads)
     const isAlreadyAuthed = this.auth.isAuthorized(req, this.allowLocalhostBypass);
