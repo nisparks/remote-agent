@@ -50,6 +50,13 @@ public class MainActivity extends Activity {
     private final Handler reconnectHandler = new Handler();
     private Runnable reconnectWatchdog;
     private volatile boolean mainFrameError = false;
+    // Load coordinator: only one navigation at a time, so slow (cellular) loads are not restarted mid-flight.
+    private volatile boolean pageLoading = false;
+    private volatile long loadStartedMs = 0;
+    private volatile String loadingBase = "";
+    private volatile String lastRequestedUrl = "";
+    private volatile boolean errorRecoveryRunning = false;
+    private static final long LOAD_GRACE_MS = 45000;
     private boolean reconnectWatchdogRunning = false;
     private String lastConnectionProbeTarget = "";
 
@@ -227,11 +234,15 @@ public class MainActivity extends Activity {
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
                 mainFrameError = false;
+                if (url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    pageLoading = true;
+                }
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
+                pageLoading = false;
                 if (!mainFrameError && url != null && (url.startsWith("http://") || url.startsWith("https://")) && !url.startsWith("http://localhost")) {
                     String base = url.split("\\?")[0].replaceAll("/+$", "");
                     prefs.edit().putString(KEY_LAST_GOOD_URL, base).apply();
@@ -240,34 +251,32 @@ public class MainActivity extends Activity {
 
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request != null && request.isForMainFrame()) {
-                    mainFrameError = true;
-                    String failedUrl = request.getUrl() != null ? request.getUrl().toString() : "";
-                    final String wanUrl = prefs.getString(KEY_WAN_URL, "");
-                    final String lanUrl = prefs.getString(KEY_LAN_URL, "");
-                    final String token = prefs.getString(KEY_TOKEN, "");
-                    if (wanUrl != null && !wanUrl.isEmpty() && !failedUrl.startsWith(wanUrl)) {
-                        reconnectHandler.postDelayed(new Runnable() {
-                            @Override public void run() { loadEndpointWithToken(wanUrl, token); }
-                        }, 750);
-                    } else if (lanUrl != null && !lanUrl.isEmpty() && !failedUrl.startsWith(lanUrl)) {
-                        reconnectHandler.postDelayed(new Runnable() {
-                            @Override public void run() { loadEndpointWithToken(lanUrl, token); }
-                        }, 750);
-                    } else {
-                        new Thread(new Runnable() {
-                            @Override public void run() {
-                                try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
-                                final String target = findReachableEndpoint(lanUrl, wanUrl);
-                                if (target != null) {
-                                    runOnUiThread(new Runnable() {
-                                        @Override public void run() { loadEndpointWithToken(target, token); }
-                                    });
-                                }
+                if (request == null || !request.isForMainFrame()) return;
+                String failedUrl = request.getUrl() != null ? request.getUrl().toString() : "";
+                // Errors for navigations we've already superseded (e.g. ERR_ABORTED) are not real failures.
+                if (!failedUrl.isEmpty() && !lastRequestedUrl.isEmpty() && !failedUrl.equals(lastRequestedUrl)) return;
+                mainFrameError = true;
+                pageLoading = false;
+                if (errorRecoveryRunning) return;
+                errorRecoveryRunning = true;
+                final String wanUrl = prefs.getString(KEY_WAN_URL, "");
+                final String lanUrl = prefs.getString(KEY_LAN_URL, "");
+                final String token = prefs.getString(KEY_TOKEN, "");
+                new Thread(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            try { Thread.sleep(750); } catch (InterruptedException ignored) {}
+                            final String target = findReachableEndpoint(lanUrl, wanUrl);
+                            if (target != null) {
+                                runOnUiThread(new Runnable() {
+                                    @Override public void run() { loadEndpointWithToken(target, token); }
+                                });
                             }
-                        }).start();
+                        } finally {
+                            errorRecoveryRunning = false;
+                        }
                     }
-                }
+                }).start();
             }
         });
 
@@ -422,6 +431,10 @@ public class MainActivity extends Activity {
                     reconnectHandler.postDelayed(this, 1000);
                     return;
                 }
+                if (pageLoading && !mainFrameError && now - loadStartedMs < LOAD_GRACE_MS) {
+                    reconnectHandler.postDelayed(this, 2000);
+                    return;
+                }
                 final String currentUrl = webView != null ? webView.getUrl() : null;
                 final String lanUrl = prefs.getString(KEY_LAN_URL, "");
                 final String wanUrl = prefs.getString(KEY_WAN_URL, "");
@@ -552,14 +565,24 @@ public class MainActivity extends Activity {
             showConnectionManagerHtml();
             return;
         }
-        webView.clearCache(true);
-        if (clean.contains("?token=")) {
-            webView.loadUrl(clean + "&_t=" + System.currentTimeMillis());
-            return;
+        String base = clean.split("\\?")[0].replaceAll("/+$", "");
+        long now = System.currentTimeMillis();
+        if (pageLoading && !mainFrameError && base.equals(loadingBase) && now - loadStartedMs < LOAD_GRACE_MS) {
+            return; // same endpoint already loading; let it finish
         }
-        String full = (token != null && !token.isEmpty())
-                ? clean + "/?token=" + Uri.encode(token) + "&_t=" + System.currentTimeMillis()
-                : clean + "/?_t=" + System.currentTimeMillis();
+        String full;
+        if (clean.contains("?token=")) {
+            full = clean + "&_t=" + now;
+        } else {
+            full = (token != null && !token.isEmpty())
+                    ? clean + "/?token=" + Uri.encode(token) + "&_t=" + now
+                    : clean + "/?_t=" + now;
+        }
+        loadingBase = base;
+        loadStartedMs = now;
+        lastRequestedUrl = full;
+        pageLoading = true;
+        mainFrameError = false;
         webView.loadUrl(full);
     }
 

@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 import { WebSocketServer, type WebSocket as WsClient } from "ws";
 import { AuthManager } from "./auth.js";
 import { DesktopAppBridge } from "./desktop-bridge.js";
@@ -520,6 +521,25 @@ export class RemoteAgentServer {
     };
   }
 
+  private sendCompressible(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: Buffer,
+    headers: Record<string, string>,
+  ): void {
+    const type = headers["Content-Type"] || "";
+    const textual = /^(text\/|application\/(javascript|json)|image\/svg)/.test(type);
+    const acceptsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+    if (textual && acceptsGzip && body.length > 1024) {
+      const gz = zlib.gzipSync(body);
+      res.writeHead(200, { ...headers, "Content-Encoding": "gzip", Vary: "Accept-Encoding", "Content-Length": gz.length });
+      res.end(gz);
+      return;
+    }
+    res.writeHead(200, { ...headers, "Content-Length": body.length });
+    res.end(body);
+  }
+
   private appendWanLog(clientIp: string, line: string): void {
     const logPath = this.accessLogPath;
     if (!logPath || this.auth.isPrivateLanOrLocalIp(clientIp)) return;
@@ -539,6 +559,11 @@ export class RemoteAgentServer {
       const authed = this.auth.isAuthorized(req, false) ? "auth" : "anon";
       const ua = String(req.headers["user-agent"] || "").slice(0, 60);
       this.appendWanLog(clientIp, `${req.method} ${pathname} ${res.statusCode} ${Date.now() - started}ms ${authed} ${ua}`);
+    });
+    res.on("close", () => {
+      if (!res.writableFinished) {
+        this.appendWanLog(clientIp, `${req.method} ${pathname} ABORTED by client after ${Date.now() - started}ms`);
+      }
     });
   }
 
@@ -1700,18 +1725,18 @@ export class RemoteAgentServer {
           .readFileSync(staticPath, "utf8")
           .replace('href="/styles.css"', `href="/styles.css?v=${uiVer}"`)
           .replace('src="/app.js"', `src="/app.js?v=${uiVer}"`);
-        res.writeHead(200, {
+        this.sendCompressible(req, res, Buffer.from(htmlRaw, "utf8"), {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store, no-cache, must-revalidate",
         });
-        res.end(htmlRaw);
         return;
       }
-      res.writeHead(200, {
+      // Versioned asset URLs (?v=<uiVersion>) change whenever the file changes, so they are safe to cache.
+      const versioned = parsedUrl.searchParams.get("v") === this.getUiVersion();
+      this.sendCompressible(req, res, fs.readFileSync(staticPath), {
         "Content-Type": mimeMap[ext] || "application/octet-stream",
-        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Cache-Control": versioned ? "private, max-age=604800, immutable" : "no-store, no-cache, must-revalidate",
       });
-      fs.createReadStream(staticPath).pipe(res);
       return;
     }
 
@@ -1724,13 +1749,12 @@ export class RemoteAgentServer {
           .readFileSync(indexHtml, "utf8")
           .replace('href="/styles.css"', `href="/styles.css?v=${uiVer}"`)
           .replace('src="/app.js"', `src="/app.js?v=${uiVer}"`);
-        res.writeHead(200, {
+        this.sendCompressible(req, res, Buffer.from(htmlRaw, "utf8"), {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store, no-cache, must-revalidate",
           "X-Robots-Tag": "noindex, nofollow",
           "X-Frame-Options": "DENY",
         });
-        res.end(htmlRaw);
         return;
       }
     }
