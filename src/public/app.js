@@ -721,6 +721,9 @@ async function loadHostStatus() {
     if (window.AndroidNative && typeof window.AndroidNative.syncEndpoints === "function") {
       window.AndroidNative.syncEndpoints(lan, wan, state.token || "");
     }
+    if (window.AndroidNative && typeof window.AndroidNative.syncLanAlternates === "function") {
+      window.AndroidNative.syncLanAlternates((state.hostStatus.lanUrls || []).join(","));
+    }
   } catch {}
 }
 

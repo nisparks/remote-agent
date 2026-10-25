@@ -37,6 +37,7 @@ public class MainActivity extends Activity {
     private static final String PREFS_NAME = "RemoteAgentPrefs";
     private static final String KEY_LAN_URL = "lan_url";
     private static final String KEY_WAN_URL = "wan_url";
+    private static final String KEY_LAN_ALTS = "lan_alt_urls";
     private static final String KEY_TOKEN = "auth_token";
     private static final String KEY_LAST_GOOD_URL = "last_good_url";
     private static final String KEY_HOSTS_JSON = "saved_hosts_json";
@@ -115,7 +116,15 @@ public class MainActivity extends Activity {
         SharedPreferences.Editor ed = prefs.edit();
         // When an APK is built with embedded local/WAN defaults, always refresh SharedPreferences so stale URLs/tokens are replaced
         if (defaultLan != null && !defaultLan.isEmpty()) {
+            String[] lans = defaultLan.split(",");
+            defaultLan = lans[0].trim();
             ed.putString(KEY_LAN_URL, defaultLan);
+            StringBuilder alts = new StringBuilder();
+            for (int i = 1; i < lans.length; i++) {
+                if (alts.length() > 0) alts.append(",");
+                alts.append(lans[i].trim());
+            }
+            ed.putString(KEY_LAN_ALTS, alts.toString());
         }
         if (defaultWan != null && !defaultWan.isEmpty()) {
             ed.putString(KEY_WAN_URL, defaultWan);
@@ -148,13 +157,7 @@ public class MainActivity extends Activity {
                     if (probeEndpoint(immediateTarget)) {
                         return;
                     }
-                    String fallback = null;
-                    if (lanUrl != null && !lanUrl.isEmpty() && !lanUrl.equals(immediateTarget) && probeEndpoint(lanUrl)) {
-                        fallback = lanUrl;
-                    } else if (wanUrl != null && !wanUrl.isEmpty() && !wanUrl.equals(immediateTarget) && probeEndpoint(wanUrl)) {
-                        fallback = wanUrl;
-                    }
-                    final String nextTarget = fallback;
+                    final String nextTarget = findReachableEndpoint(lanUrl, wanUrl);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
@@ -319,14 +322,7 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                String chosen = null;
-                if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
-                    chosen = lanUrl;
-                } else if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
-                    chosen = wanUrl;
-                }
-
-                final String target = chosen;
+                final String target = findReachableEndpoint(lanUrl, wanUrl);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -341,12 +337,38 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private String findReachableEndpoint(String lanUrl, String wanUrl) {
-        if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
-            return lanUrl;
+    // Backup WAN route: same host on the next port (e.g. router forwards 4321 -> Wi-Fi IP, 4322 -> Ethernet IP)
+    private String backupWanUrl(String wanUrl) {
+        try {
+            Uri u = Uri.parse(normalizeEndpointUrl(wanUrl));
+            int port = u.getPort();
+            if (u.getHost() == null || port <= 0) return null;
+            return u.getScheme() + "://" + u.getHost() + ":" + (port + 1);
+        } catch (Exception e) {
+            return null;
         }
-        if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
-            return wanUrl;
+    }
+
+    private java.util.List<String> candidateEndpoints(String lanUrl, String wanUrl) {
+        java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<String>();
+        if (lanUrl != null && !lanUrl.isEmpty()) set.add(lanUrl.trim().replaceAll("/+$", ""));
+        String alts = prefs.getString(KEY_LAN_ALTS, "");
+        if (alts != null) {
+            for (String a : alts.split(",")) {
+                if (!a.trim().isEmpty()) set.add(a.trim().replaceAll("/+$", ""));
+            }
+        }
+        if (wanUrl != null && !wanUrl.isEmpty()) {
+            set.add(wanUrl.trim().replaceAll("/+$", ""));
+            String backup = backupWanUrl(wanUrl);
+            if (backup != null) set.add(backup);
+        }
+        return new java.util.ArrayList<String>(set);
+    }
+
+    private String findReachableEndpoint(String lanUrl, String wanUrl) {
+        for (String candidate : candidateEndpoints(lanUrl, wanUrl)) {
+            if (probeEndpoint(candidate)) return candidate;
         }
         return null;
     }
@@ -651,6 +673,11 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void syncLanAlternates(String csv) {
+            if (csv != null) prefs.edit().putString(KEY_LAN_ALTS, csv.trim()).apply();
+        }
+
+        @JavascriptInterface
         public String getSavedToken() {
             return prefs.getString(KEY_TOKEN, "");
         }
@@ -663,13 +690,7 @@ public class MainActivity extends Activity {
             new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    String chosen = null;
-                    if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
-                        chosen = lanUrl;
-                    } else if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
-                        chosen = wanUrl;
-                    }
-                    final String target = chosen;
+                    final String target = findReachableEndpoint(lanUrl, wanUrl);
                     if (target != null) {
                         runOnUiThread(new Runnable() {
                             @Override

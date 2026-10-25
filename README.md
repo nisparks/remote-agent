@@ -107,7 +107,8 @@ No installation is needed—the full companion UI runs in any modern browser:
 - *Persistence Note*: Free Quick Tunnels (`*.trycloudflare.com`) require no account, but generate a new URL if the PC reboots while you are away on 5G. (If you have a free Cloudflare account, you can set `"cloudflareTunnelToken"` in `~/.copilot/remote-agent-wan.json` for a permanent subdomain.)
 
 #### Path 2: Custom Domain / Dynamic DNS + Let's Encrypt TLS + Router Port Forwarding (Permanent Direct WAN)
-1. **Router Port-Forwarding**: On your router, forward external **TCP port `4321` → `<your-desktop-lan-ip>:4321`**.
+1. **Router Port-Forwarding**: On your router, forward external **TCP port `4321` → `<your-desktop-lan-ip>:4321`**. Reserve that LAN IP in your router's DHCP settings so it never changes.
+   - **Dual-NIC backup route (optional):** If your desktop has both Wi-Fi and Ethernet, reserve an IP for each adapter, forward `4321 → <wifi-ip>:4321` and `4322 → <ethernet-ip>:4321`. The Android app automatically falls back to `https://remote.example.com:4322` (WAN port + 1) and to every LAN address the desktop reports, so losing one adapter doesn't drop the connection.
 2. **Enable Hairpin NAT (NAT Loopback)**: Enable Hairpin NAT on your router so the exact same `https://remote.example.com:4321` URL works seamlessly whether your phone is on 5G cellular or home Wi-Fi.
 3. **Windows Firewall**: Click **🛡️ Allow LAN Firewall** in `RemoteAgentDesktop.exe` (or check the Firewall box in the installer) to allow inbound TCP port `4321`.
 4. **TLS Certificate**: Place your Let's Encrypt certificate (`fullchain.pem` → `~/.copilot/tls/cert.pem`) and private key (`privkey.pem` → `~/.copilot/tls/key.pem`) in `~/.copilot/tls/`. *(If none is present, `src/tls.ts` generates a fallback ECDSA certificate on startup.)*
