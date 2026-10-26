@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 import { WebSocketServer, type WebSocket as WsClient } from "ws";
 import { AuthManager } from "./auth.js";
 import { DesktopAppBridge } from "./desktop-bridge.js";
@@ -32,6 +33,8 @@ export interface RemoteAgentServerOptions {
   customToken?: string;
   allowLocalhostBypass?: boolean;
   enableWanAutoStart?: boolean;
+  /** WAN access log path; null disables. Defaults to ~/.copilot/remote-agent-access.log unless port is 0 (tests). */
+  accessLogPath?: string | null;
 }
 
 export class RemoteAgentServer {
@@ -67,12 +70,19 @@ export class RemoteAgentServer {
   private host: string;
   private allowLocalhostBypass: boolean;
   private enableWanAutoStart: boolean;
+  private accessLogPath: string | null;
 
   constructor(options: RemoteAgentServerOptions = {}) {
     this.port = options.port ?? Number(process.env.PORT || 4321);
     this.host = options.host ?? (process.env.HOST || "0.0.0.0");
     this.allowLocalhostBypass = options.allowLocalhostBypass ?? true;
     this.enableWanAutoStart = options.enableWanAutoStart ?? true;
+    this.accessLogPath =
+      options.accessLogPath !== undefined
+        ? options.accessLogPath
+        : this.port === 0
+          ? null
+          : path.join(os.homedir(), ".copilot", "remote-agent-access.log");
 
     this.auth = new AuthManager(options.customToken);
     this.store = new SessionStateStore({ persistEventIndex: !options.customToken });
@@ -246,7 +256,9 @@ export class RemoteAgentServer {
       }
 
       if (!this.auth.isAuthorized(req, this.allowLocalhostBypass)) {
-        logEvent("warn", "websocket unauthorized", { ip: this.auth.getClientIp(req) });
+        const deniedIp = this.auth.getClientIp(req);
+        logEvent("warn", "websocket unauthorized", { ip: deniedIp });
+        this.appendWanLog(deniedIp, "WS /ws 401");
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
@@ -254,6 +266,11 @@ export class RemoteAgentServer {
 
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         const clientIp = this.auth.getClientIp(req);
+        const wsStarted = Date.now();
+        this.appendWanLog(clientIp, "WS /ws open");
+        ws.on("close", (code) =>
+          this.appendWanLog(clientIp, `WS /ws close code=${code} after ${Math.round((Date.now() - wsStarted) / 1000)}s`)
+        );
         this.clients.add(ws);
         this.wsAlive.set(ws, true);
         logEvent("info", "websocket connected", { ip: clientIp, clients: this.clients.size });
@@ -567,12 +584,59 @@ export class RemoteAgentServer {
     };
   }
 
+  private sendCompressible(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    body: Buffer,
+    headers: Record<string, string>,
+  ): void {
+    const type = headers["Content-Type"] || "";
+    const textual = /^(text\/|application\/(javascript|json)|image\/svg)/.test(type);
+    const acceptsGzip = /\bgzip\b/.test(String(req.headers["accept-encoding"] || ""));
+    if (textual && acceptsGzip && body.length > 1024) {
+      const gz = zlib.gzipSync(body);
+      res.writeHead(200, { ...headers, "Content-Encoding": "gzip", Vary: "Accept-Encoding", "Content-Length": gz.length });
+      res.end(gz);
+      return;
+    }
+    res.writeHead(200, { ...headers, "Content-Length": body.length });
+    res.end(body);
+  }
+
+  private appendWanLog(clientIp: string, line: string): void {
+    const logPath = this.accessLogPath;
+    if (!logPath || this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    try {
+      try {
+        if (fs.statSync(logPath).size > 1_000_000) fs.renameSync(logPath, `${logPath}.1`);
+      } catch {}
+      fs.appendFileSync(logPath, `${new Date().toISOString()} ${clientIp} ${line}\n`);
+    } catch {}
+  }
+
+  // Records non-LAN requests (no query strings/tokens) to help diagnose WAN connectivity.
+  private logWanAccess(req: http.IncomingMessage, res: http.ServerResponse, clientIp: string, pathname: string): void {
+    if (!this.accessLogPath || this.auth.isPrivateLanOrLocalIp(clientIp)) return;
+    const started = Date.now();
+    res.on("finish", () => {
+      const authed = this.auth.isAuthorized(req, false) ? "auth" : "anon";
+      const ua = String(req.headers["user-agent"] || "").slice(0, 60);
+      this.appendWanLog(clientIp, `${req.method} ${pathname} ${res.statusCode} ${Date.now() - started}ms ${authed} ${ua}`);
+    });
+    res.on("close", () => {
+      if (!res.writableFinished) {
+        this.appendWanLog(clientIp, `${req.method} ${pathname} ABORTED by client after ${Date.now() - started}ms`);
+      }
+    });
+  }
+
   private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const method = req.method || "GET";
     const parsedUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = parsedUrl.pathname;
     const clientIp = this.auth.getClientIp(req);
     const userAgent = String(req.headers["user-agent"] || "");
+    this.logWanAccess(req, res, clientIp, pathname);
 
     // 1. Bot/Vulnerability Scanner Honeypot Trap (never blocks already-authenticated devices or static UI loads)
     const isAlreadyAuthed = this.auth.isAuthorized(req, this.allowLocalhostBypass);
@@ -1728,18 +1792,18 @@ export class RemoteAgentServer {
           .readFileSync(staticPath, "utf8")
           .replace('href="/styles.css"', `href="/styles.css?v=${uiVer}"`)
           .replace('src="/app.js"', `src="/app.js?v=${uiVer}"`);
-        res.writeHead(200, {
+        this.sendCompressible(req, res, Buffer.from(htmlRaw, "utf8"), {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store, no-cache, must-revalidate",
         });
-        res.end(htmlRaw);
         return;
       }
-      res.writeHead(200, {
+      // Versioned asset URLs (?v=<uiVersion>) change whenever the file changes, so they are safe to cache.
+      const versioned = parsedUrl.searchParams.get("v") === this.getUiVersion();
+      this.sendCompressible(req, res, fs.readFileSync(staticPath), {
         "Content-Type": mimeMap[ext] || "application/octet-stream",
-        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Cache-Control": versioned ? "private, max-age=604800, immutable" : "no-store, no-cache, must-revalidate",
       });
-      fs.createReadStream(staticPath).pipe(res);
       return;
     }
 
@@ -1752,13 +1816,12 @@ export class RemoteAgentServer {
           .readFileSync(indexHtml, "utf8")
           .replace('href="/styles.css"', `href="/styles.css?v=${uiVer}"`)
           .replace('src="/app.js"', `src="/app.js?v=${uiVer}"`);
-        res.writeHead(200, {
+        this.sendCompressible(req, res, Buffer.from(htmlRaw, "utf8"), {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store, no-cache, must-revalidate",
           "X-Robots-Tag": "noindex, nofollow",
           "X-Frame-Options": "DENY",
         });
-        res.end(htmlRaw);
         return;
       }
     }

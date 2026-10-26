@@ -29,17 +29,18 @@ const apksignerJar = path.join(buildToolsDir, "lib", "apksigner.jar");
 
 function getLanUrl() {
   const nets = os.networkInterfaces();
+  const urls = [];
   for (const [name, addrs] of Object.entries(nets)) {
     for (const addr of addrs || []) {
       if (addr.family !== "IPv4" || addr.internal) continue;
       const lower = name.toLowerCase();
       if (lower.includes("wsl") || lower.includes("vethernet") || lower.includes("docker")) continue;
-      if (!addr.address.startsWith("100.")) {
-        return `http://${addr.address}:4321`;
+      if (!addr.address.startsWith("100.") && !addr.address.startsWith("169.254.")) {
+        urls.push(`http://${addr.address}:4321`);
       }
     }
   }
-  return "";
+  return urls.join(",");
 }
 
 function getPairingToken() {

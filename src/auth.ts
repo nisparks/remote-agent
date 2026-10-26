@@ -539,6 +539,7 @@ export class AuthManager {
     for (const [name, addrs] of Object.entries(nets)) {
       for (const addr of addrs || []) {
         if (addr.family !== "IPv4" || addr.internal) continue;
+        if (addr.address.startsWith("169.254.")) continue;
         const lowerName = name.toLowerCase();
         const isVirtualSwitch =
           lowerName.includes("wsl") ||
@@ -558,7 +559,7 @@ export class AuthManager {
     if (lanUrls.length === 0) {
       for (const addrs of Object.values(nets)) {
         for (const addr of addrs || []) {
-          if (addr.family === "IPv4" && !addr.internal && !addr.address.startsWith("100.")) {
+          if (addr.family === "IPv4" && !addr.internal && !addr.address.startsWith("100.") && !addr.address.startsWith("169.254.")) {
             lanUrls.push(`http://${addr.address}:${port}`);
           }
         }

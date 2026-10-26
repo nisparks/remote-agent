@@ -45,7 +45,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "RemoteAgentPrefs";
@@ -53,10 +52,14 @@ public class MainActivity extends Activity {
     private static final String KEY_WAN_URL = "wan_url";
     private static final String KEY_TOKEN = "auth_token";
     private static final String KEY_LAST_GOOD_URL = "last_good_url";
+    private static final String KEY_LAN_ALTS = "lan_alt_urls";
     private static final String KEY_HOSTS_JSON = "saved_hosts_json";
     private static final String KEY_KEEP_AWAKE = "keep_awake";
     private static final int FILE_CHOOSER_RESULT_CODE = 1001;
-    private static final int PROBE_TIMEOUT_MS = 3000;
+    // Cellular TLS handshakes can be slow; LAN addresses either answer quickly or are unreachable.
+    private static final int PROBE_TIMEOUT_HTTPS_MS = 6000;
+    private static final int PROBE_TIMEOUT_HTTP_MS = 2500;
+    private static final long PROBE_DEADLINE_MS = 9000;
     private static final long PREFERRED_ENDPOINT_WAIT_MS = 3500;
     private static final long[] RETRY_DELAYS_MS = {2000, 4000, 8000, 15000, 30000};
     private static final String LOCAL_PAGE_BASE = "http://localhost/";
@@ -178,7 +181,10 @@ public class MainActivity extends Activity {
         SharedPreferences.Editor ed = prefs.edit();
         // A pre-paired APK refreshes stored endpoints/token so stale values from older installs are replaced.
         if (defaultLan != null && !defaultLan.isEmpty()) {
-            ed.putString(KEY_LAN_URL, defaultLan);
+            // Builds embed every desktop LAN address (e.g. Wi-Fi and Ethernet) as a comma-separated list.
+            String[] lans = defaultLan.split(",");
+            ed.putString(KEY_LAN_URL, lans[0].trim());
+            ed.putString(KEY_LAN_ALTS, joinPrivateLanUrls(lans, 1, lans[0]));
         }
         if (defaultWan != null && !defaultWan.isEmpty()) {
             ed.putString(KEY_WAN_URL, defaultWan);
@@ -360,10 +366,54 @@ public class MainActivity extends Activity {
     /** Remote HTTPS first: it works on cellular and (via hairpin NAT) at home, so the page origin stays stable. */
     private List<String> candidateEndpoints() {
         LinkedHashSet<String> ordered = new LinkedHashSet<>();
-        addCandidate(ordered, prefs.getString(KEY_WAN_URL, ""));
+        String wan = prefs.getString(KEY_WAN_URL, "");
+        addCandidate(ordered, wan);
+        addCandidate(ordered, backupWanUrl(wan));
         addCandidate(ordered, prefs.getString(KEY_LAN_URL, ""));
+        String alts = prefs.getString(KEY_LAN_ALTS, "");
+        if (alts != null) {
+            for (String alt : alts.split(",")) addCandidate(ordered, alt);
+        }
         addCandidate(ordered, prefs.getString(KEY_LAST_GOOD_URL, ""));
         return new ArrayList<>(ordered);
+    }
+
+    /** Optional second router forward to the same desktop on the next port (e.g. 4322 -> its Ethernet IP). */
+    private String backupWanUrl(String wanUrl) {
+        String clean = normalizeEndpointUrl(wanUrl);
+        if (clean.isEmpty()) return "";
+        try {
+            Uri u = Uri.parse(clean);
+            int port = u.getPort();
+            if (u.getHost() == null || port <= 0 || port >= 65535) return "";
+            return u.getScheme() + "://" + u.getHost() + ":" + (port + 1);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static boolean isPrivateLanUrl(String url) {
+        try {
+            Uri u = Uri.parse(url);
+            String host = u.getHost();
+            return "http".equals(u.getScheme()) && host != null
+                    && host.matches("^(10\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.)[0-9.]+$");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Joins valid private-LAN URLs from parts[start..], skipping the primary LAN URL. */
+    private String joinPrivateLanUrls(String[] parts, int start, String primary) {
+        String primaryClean = normalizeEndpointUrl(primary);
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < parts.length; i++) {
+            String clean = normalizeEndpointUrl(parts[i]);
+            if (clean.isEmpty() || clean.equals(primaryClean) || !isPrivateLanUrl(clean)) continue;
+            if (sb.length() > 0) sb.append(",");
+            sb.append(clean);
+        }
+        return sb.toString();
     }
 
     private void addCandidate(LinkedHashSet<String> set, String raw) {
@@ -409,7 +459,14 @@ public class MainActivity extends Activity {
         if (!started) connectInFlight = false;
     }
 
+    /**
+     * Probes all candidates in parallel and returns results in candidate order. The first ok entry is
+     * the endpoint to use: the highest-priority reachable one. Higher-priority candidates are awaited
+     * only during the preference window, but any candidate may still succeed until the deadline, so a
+     * slow-but-working cellular link is not reported as unreachable.
+     */
     private List<ProbeResult> probeInPreferenceOrder(List<String> candidates) {
+        final int n = candidates.size();
         List<Future<ProbeResult>> futures = new ArrayList<>();
         for (final String base : candidates) {
             try {
@@ -423,19 +480,54 @@ public class MainActivity extends Activity {
                 return new ArrayList<>(); // Activity is shutting down
             }
         }
-        List<ProbeResult> results = new ArrayList<>();
-        long deadline = SystemClock.elapsedRealtime() + PREFERRED_ENDPOINT_WAIT_MS + PROBE_TIMEOUT_MS;
-        for (int i = 0; i < futures.size(); i++) {
-            String base = candidates.get(i);
+        ProbeResult[] done = new ProbeResult[n];
+        long start = SystemClock.elapsedRealtime();
+        while (true) {
+            long elapsed = SystemClock.elapsedRealtime() - start;
+            boolean allDone = true;
+            for (int i = 0; i < n; i++) {
+                if (done[i] != null) continue;
+                Future<ProbeResult> f = futures.get(i);
+                if (!f.isDone()) {
+                    allDone = false;
+                    continue;
+                }
+                try {
+                    done[i] = f.get();
+                } catch (Exception e) {
+                    done[i] = new ProbeResult(candidates.get(i), false, "probe failed");
+                }
+            }
+            boolean preferenceOver = elapsed >= PREFERRED_ENDPOINT_WAIT_MS;
+            boolean higherPending = false;
+            for (int i = 0; i < n; i++) {
+                if (done[i] == null) {
+                    higherPending = true;
+                } else if (done[i].ok && (!higherPending || preferenceOver)) {
+                    return snapshotProbeResults(candidates, done, futures);
+                }
+            }
+            if (allDone || elapsed >= PROBE_DEADLINE_MS) {
+                return snapshotProbeResults(candidates, done, futures);
+            }
             try {
-                long wait = i == 0
-                        ? PREFERRED_ENDPOINT_WAIT_MS
-                        : Math.max(100, deadline - SystemClock.elapsedRealtime());
-                ProbeResult r = futures.get(i).get(wait, TimeUnit.MILLISECONDS);
-                results.add(r);
-                if (r.ok) break;
-            } catch (Exception e) {
-                results.add(new ProbeResult(base, false, "timed out"));
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return snapshotProbeResults(candidates, done, futures);
+            }
+        }
+    }
+
+    private static List<ProbeResult> snapshotProbeResults(
+            List<String> candidates, ProbeResult[] done, List<Future<ProbeResult>> futures) {
+        List<ProbeResult> results = new ArrayList<>();
+        for (int i = 0; i < done.length; i++) {
+            if (done[i] != null) {
+                results.add(done[i]);
+            } else {
+                futures.get(i).cancel(true);
+                results.add(new ProbeResult(candidates.get(i), false, "timed out"));
             }
         }
         return results;
@@ -445,9 +537,10 @@ public class MainActivity extends Activity {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(base + "/api/health");
+            int timeoutMs = base.startsWith("https://") ? PROBE_TIMEOUT_HTTPS_MS : PROBE_TIMEOUT_HTTP_MS;
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(PROBE_TIMEOUT_MS);
-            conn.setReadTimeout(PROBE_TIMEOUT_MS);
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
             conn.setUseCaches(false);
             conn.setRequestMethod("GET");
             int code = conn.getResponseCode();
@@ -460,26 +553,53 @@ public class MainActivity extends Activity {
             boolean ok = body.toString().contains("\"ok\":true");
             return new ProbeResult(base, ok, ok ? "" : "unexpected response");
         } catch (javax.net.ssl.SSLException e) {
-            return new ProbeResult(base, false, "certificate error");
+            return new ProbeResult(base, false, "TLS error: " + shortMessage(e));
         } catch (java.net.SocketTimeoutException e) {
             return new ProbeResult(base, false, "timed out");
         } catch (java.net.UnknownHostException e) {
             return new ProbeResult(base, false, "DNS lookup failed");
         } catch (java.net.ConnectException e) {
-            return new ProbeResult(base, false, "connection refused");
+            return new ProbeResult(base, false, "can't connect" + errnoSuffix(e));
         } catch (Exception e) {
-            return new ProbeResult(base, false, e.getClass().getSimpleName());
+            return new ProbeResult(base, false, e.getClass().getSimpleName() + errnoSuffix(e));
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
+    /** Extracts the errno name (e.g. ECONNREFUSED, ENETUNREACH) that distinguishes network failure modes. */
+    private static String errnoSuffix(Exception e) {
+        String msg = e.getMessage();
+        if (msg == null) return "";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b(E[A-Z]{4,})\\b").matcher(msg);
+        return m.find() ? " (" + m.group(1) + ")" : "";
+    }
+
+    private static String shortMessage(Exception e) {
+        String msg = e.getMessage();
+        if (msg == null || msg.isEmpty()) return e.getClass().getSimpleName();
+        int colon = msg.lastIndexOf(": ");
+        String tail = colon >= 0 && colon + 2 < msg.length() ? msg.substring(colon + 2) : msg;
+        return tail.length() > 90 ? tail.substring(0, 90) + "…" : tail;
+    }
+
     private String summarize(List<ProbeResult> results) {
         StringBuilder sb = new StringBuilder();
         String wan = normalizeEndpointUrl(prefs.getString(KEY_WAN_URL, ""));
+        String backup = backupWanUrl(wan);
         for (ProbeResult r : results) {
             if (sb.length() > 0) sb.append(" • ");
-            String label = r.base.equals(wan) ? "Remote" : (r.base.startsWith("http://") ? "Home Wi-Fi" : "Saved URL");
+            String label;
+            if (r.base.equals(wan)) {
+                label = "Remote";
+            } else if (r.base.equals(backup)) {
+                label = "Remote backup port";
+            } else if (r.base.startsWith("http://")) {
+                Uri u = Uri.parse(r.base);
+                label = "Home network " + (u.getHost() != null ? u.getHost() : "");
+            } else {
+                label = "Saved URL";
+            }
             sb.append(label).append(": ").append(r.error);
         }
         return sb.toString();
@@ -860,6 +980,13 @@ public class MainActivity extends Activity {
                 }
             }
             ed.apply();
+        }
+
+        @JavascriptInterface
+        public void syncLanAlternates(String csv) {
+            if (!trusted() || csv == null) return;
+            String alts = joinPrivateLanUrls(csv.split(","), 0, prefs.getString(KEY_LAN_URL, ""));
+            prefs.edit().putString(KEY_LAN_ALTS, alts).apply();
         }
 
         @JavascriptInterface
