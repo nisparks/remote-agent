@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
+import { DETAIL_EVENT_TYPES, EventLogIndexer, JsonlLineScanner, fileIdentity } from "./event-log.js";
 import type {
   ArtifactCategory,
   ArtifactItem,
@@ -37,6 +38,25 @@ const MCP_CONFIG_PATH = path.join(COPILOT_HOME, "mcp-config.json");
 const REVIEWS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-reviews.json");
 const PEERS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-peers.json");
 const UI_PREFS_FILE_PATH = path.join(COPILOT_HOME, "remote-agent-ui-prefs.json");
+
+// Bounded event-log windows keep request latency predictable even when a session log grows to many GB.
+const DETAIL_REGION_BYTES = 32 * 1024 * 1024;
+const DETAIL_MAX_RAW_SCAN_BYTES = 160 * 1024 * 1024;
+const DETAIL_TARGET_CHARS = 12 * 1024 * 1024;
+const DETAIL_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const DETAIL_READ_CHUNK_BYTES = 8 * 1024 * 1024;
+const DETAIL_MAX_WINDOWS = 4;
+const DETAIL_MAX_PARSED_SESSIONS = 6;
+const DETAIL_REPARSE_MIN_INTERVAL_MS = 1500;
+
+interface DetailEventWindow {
+  fileId: string;
+  startOffset: number;
+  endOffset: number;
+  lines: string[];
+  offsets: number[];
+  keptChars: number;
+}
 
 const EXTENSION_MIME_MAP: Record<string, { category: ArtifactCategory; mime: string }> = {
   ".png": { category: "image", mime: "image/png" },
@@ -152,6 +172,10 @@ function parseSimpleYaml(text: string): Record<string, string> {
 
 export class SessionStateStore {
   private allowedRootsCache: string[] = [];
+  private artifactPathCache = new Map<
+    string,
+    { resolved: string | null; size: number; mtimeMs: number; checkedAt: number }
+  >();
   private allowedRootsLastUpdated = 0;
   private quotaCache: { data: CopilotQuotaStatus | null; cachedAt: number } | null = null;
   private sessionsListCache: { list: RemoteSessionSummary[]; cachedAt: number } | null = null;
@@ -159,22 +183,14 @@ export class SessionStateStore {
     string,
     { counts: RemoteSessionSummary["counts"]; cachedAt: number }
   >();
-  private eventsLineCache = new Map<
-    string,
-    {
-      birthtimeMs: number;
-      offset: number;
-      remainder: string;
-      filteredLines: string[];
-      subAgentsStarted: number;
-      subAgentsCompleted: number;
-    }
-  >();
+  private readonly indexer: EventLogIndexer;
+  private detailWindows = new Map<string, DetailEventWindow>();
   private sessionDetailCache = new Map<
     string,
     {
       eventsSize: number;
       eventsMtimeMs: number;
+      indexStamp: string;
       cachedAt: number;
       data: {
         turns: ConversationTurn[];
@@ -191,113 +207,208 @@ export class SessionStateStore {
     }
   >();
 
+  constructor(options: { persistEventIndex?: boolean } = {}) {
+    this.indexer = new EventLogIndexer(options.persistEventIndex !== false);
+    this.indexer.onIndexed((sessionId) => {
+      this.quickCountsCache.delete(sessionId);
+    });
+  }
+
+  stopBackgroundWork(): void {
+    this.indexer.stop();
+  }
+
   invalidateSessionCache(sessionId?: string): void {
     this.sessionsListCache = null;
     if (sessionId) {
+      // Detail data is validated by log size/mtime, so frequent file events do not force full reparses.
       this.quickCountsCache.delete(sessionId);
-      this.sessionDetailCache.delete(sessionId);
     } else {
       this.quickCountsCache.clear();
       this.sessionDetailCache.clear();
     }
   }
 
-  private getFilteredEventLines(
-    sessionId: string,
-    eventsPath: string
-  ): {
-    filteredLines: string[];
-    subAgentsStarted: number;
-    subAgentsCompleted: number;
-  } {
-    const stat = fs.statSync(eventsPath);
-    const MAX_DIRECT_READ = 350 * 1024 * 1024;
-    let entry = this.eventsLineCache.get(sessionId);
-
+  private loadDetailWindow(sessionId: string, eventsPath: string): DetailEventWindow | null {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(eventsPath);
+    } catch {
+      return null;
+    }
+    const fileId = fileIdentity(stat);
+    let win = this.detailWindows.get(sessionId);
     if (
-      !entry ||
-      entry.birthtimeMs !== stat.birthtimeMs ||
-      stat.size < entry.offset
+      win &&
+      (win.fileId !== fileId ||
+        stat.size < win.endOffset ||
+        stat.size - win.endOffset > DETAIL_MAX_RAW_SCAN_BYTES)
     ) {
-      entry = {
-        birthtimeMs: stat.birthtimeMs,
-        offset: 0,
-        remainder: "",
-        filteredLines: [],
-        subAgentsStarted: 0,
-        subAgentsCompleted: 0,
-      };
-      this.eventsLineCache.set(sessionId, entry);
+      win = undefined;
     }
 
-    if (stat.size === entry.offset) {
-      return entry;
-    }
-
-    const ingestRawLines = (rawLines: string[]) => {
-      for (const line of rawLines) {
-        if (!line.trim()) continue;
-        if (
-          line.includes('"session.binary_asset"') ||
-          line.includes('"hook.start"') ||
-          line.includes('"hook.end"') ||
-          line.includes('"session.usage_record"') ||
-          line.includes('"session.usage_checkpoint"')
-        ) {
-          continue;
-        }
-        if (line.includes('"subagent.started"')) {
-          entry!.subAgentsStarted++;
-        } else if (line.includes('"subagent.completed"')) {
-          entry!.subAgentsCompleted++;
-        }
-        entry!.filteredLines.push(line);
-      }
-    };
-
-    const delta = stat.size - entry.offset;
     const fd = fs.openSync(eventsPath, "r");
     try {
-      if (entry.offset === 0 && stat.size > MAX_DIRECT_READ) {
-        const headLen = Math.min(64 * 1024, stat.size);
-        const headBuf = Buffer.allocUnsafe(headLen);
-        fs.readSync(fd, headBuf, 0, headLen, 0);
-        const headLines = headBuf.toString("utf8").split(/\r?\n/).slice(0, 5);
-
-        const tailLen = 32 * 1024 * 1024;
-        const tailBuf = Buffer.allocUnsafe(tailLen);
-        fs.readSync(fd, tailBuf, 0, tailLen, stat.size - tailLen);
-        const tailLines = tailBuf.toString("utf8").split(/\r?\n/).slice(1);
-        ingestRawLines([...headLines, ...tailLines]);
-        entry.offset = stat.size;
-        entry.remainder = "";
-      } else {
-        const CHUNK_SIZE = 16 * 1024 * 1024;
-        let pos = entry.offset;
-        let carry = entry.remainder;
-        const buf = Buffer.allocUnsafe(Math.min(CHUNK_SIZE, delta));
-        while (pos < stat.size) {
-          const toRead = Math.min(buf.length, stat.size - pos);
-          const bytesRead = fs.readSync(fd, buf, 0, toRead, pos);
-          if (bytesRead <= 0) break;
-          pos += bytesRead;
-          const text = carry + buf.toString("utf8", 0, bytesRead);
-          const parts = text.split(/\r?\n/);
-          carry = parts.pop() ?? "";
-          ingestRawLines(parts);
+      if (!win) {
+        win = this.readTailWindow(fd, stat.size, fileId);
+      } else if (stat.size > win.endOffset) {
+        const delta = this.readDetailRegion(fd, win.endOffset, stat.size, false);
+        for (let i = 0; i < delta.lines.length; i++) {
+          win.lines.push(delta.lines[i]);
+          win.offsets.push(delta.offsets[i]);
+          win.keptChars += delta.lines[i].length;
         }
-        if (carry.trim() && carry.trim().endsWith("}")) {
-          ingestRawLines([carry]);
-          carry = "";
-        }
-        entry.offset = pos;
-        entry.remainder = carry;
+        win.endOffset = delta.completedOffset;
       }
     } finally {
       fs.closeSync(fd);
     }
 
-    return entry;
+    if (win.keptChars > DETAIL_TARGET_CHARS * 1.25) {
+      let drop = 0;
+      while (drop < win.lines.length - 1 && win.keptChars > DETAIL_TARGET_CHARS) {
+        win.keptChars -= win.lines[drop].length;
+        drop++;
+      }
+      win.lines.splice(0, drop);
+      win.offsets.splice(0, drop);
+    }
+    win.startOffset = win.offsets.length > 0 ? win.offsets[0] : win.endOffset;
+
+    this.detailWindows.delete(sessionId);
+    this.detailWindows.set(sessionId, win);
+    while (this.detailWindows.size > DETAIL_MAX_WINDOWS) {
+      const oldest = this.detailWindows.keys().next().value;
+      if (oldest === undefined) break;
+      this.detailWindows.delete(oldest);
+    }
+    return win;
+  }
+
+  private readTailWindow(fd: number, size: number, fileId: string): DetailEventWindow {
+    const regions: Array<{ lines: string[]; offsets: number[] }> = [];
+    let regionEnd = size;
+    let endOffset = -1;
+    let keptChars = 0;
+    let rawRead = 0;
+
+    while (regionEnd > 0) {
+      const regionStart = Math.max(0, regionEnd - DETAIL_REGION_BYTES);
+      const region = this.readDetailRegion(fd, regionStart, regionEnd, regionStart > 0);
+      rawRead += regionEnd - regionStart;
+      if (endOffset < 0) endOffset = region.completedOffset;
+      regions.unshift({ lines: region.lines, offsets: region.offsets });
+      for (const line of region.lines) keptChars += line.length;
+      if (regionStart === 0 || keptChars >= DETAIL_TARGET_CHARS || rawRead >= DETAIL_MAX_RAW_SCAN_BYTES) {
+        break;
+      }
+      // The line crossing regionStart is read in full as the last line of the next older region.
+      regionEnd = region.firstLineStart >= 0 ? region.firstLineStart : regionStart;
+    }
+
+    const lines: string[] = [];
+    const offsets: number[] = [];
+    for (const region of regions) {
+      for (let i = 0; i < region.lines.length; i++) {
+        lines.push(region.lines[i]);
+        offsets.push(region.offsets[i]);
+      }
+    }
+    const finalEnd = Math.max(0, endOffset);
+    return {
+      fileId,
+      startOffset: offsets.length > 0 ? offsets[0] : finalEnd,
+      endOffset: finalEnd,
+      lines,
+      offsets,
+      keptChars,
+    };
+  }
+
+  private readDetailRegion(
+    fd: number,
+    start: number,
+    end: number,
+    startsMidLine: boolean
+  ): { lines: string[]; offsets: number[]; completedOffset: number; firstLineStart: number } {
+    const lines: string[] = [];
+    const offsets: number[] = [];
+    const scanner = new JsonlLineScanner(
+      start,
+      (type) => DETAIL_EVENT_TYPES.has(type),
+      (line, offset) => {
+        lines.push(line);
+        offsets.push(offset);
+      },
+      DETAIL_MAX_LINE_BYTES,
+      startsMidLine
+    );
+    let pos = start;
+    const buf = Buffer.allocUnsafe(Math.max(1, Math.min(DETAIL_READ_CHUNK_BYTES, end - start)));
+    while (pos < end) {
+      const len = Math.min(buf.length, end - pos);
+      const bytesRead = fs.readSync(fd, buf, 0, len, pos);
+      if (bytesRead <= 0) break;
+      scanner.push(buf.subarray(0, bytesRead), pos);
+      pos += bytesRead;
+    }
+    return {
+      lines,
+      offsets,
+      completedOffset: scanner.completedOffset,
+      firstLineStart: scanner.firstBoundary,
+    };
+  }
+
+  private readSessionStartFromHead(eventsPath: string): string | null {
+    let found: string | null = null;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(eventsPath, "r");
+      const len = Math.min(256 * 1024, fs.fstatSync(fd).size);
+      if (len <= 0) return null;
+      const buf = Buffer.allocUnsafe(len);
+      const bytesRead = fs.readSync(fd, buf, 0, len, 0);
+      const scanner = new JsonlLineScanner(
+        0,
+        (type) => type === "session.start",
+        (line) => {
+          if (!found) found = line;
+        },
+        64 * 1024
+      );
+      scanner.push(buf.subarray(0, bytesRead), 0);
+    } catch {
+      // Ignore unreadable heads
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+    return found;
+  }
+
+  private getDetailEventLines(sessionId: string, eventsPath: string): string[] {
+    const win = this.loadDetailWindow(sessionId, eventsPath);
+    this.indexer.requestScan(sessionId, eventsPath, true);
+    if (!win) return [];
+    if (win.startOffset === 0) return win.lines;
+
+    const prefix: string[] = [];
+    const idx = this.indexer.get(sessionId);
+    if (idx && idx.fileId === win.fileId) {
+      for (const meta of idx.metaLines) {
+        if (meta.offset < win.startOffset) prefix.push(meta.line);
+      }
+    }
+    if (!prefix.some((line) => line.startsWith('{"type":"session.start"'))) {
+      const head = this.readSessionStartFromHead(eventsPath);
+      if (head) prefix.unshift(head);
+    }
+    return prefix.length > 0 ? prefix.concat(win.lines) : win.lines;
+  }
+
+  private getIndexStamp(sessionId: string): string {
+    const idx = this.indexer.get(sessionId);
+    return idx ? `${idx.fileId}:${idx.metaLines.length}` : "";
   }
 
   getGitHubAccounts(): GitHubAccountInfo[] {
@@ -712,6 +823,13 @@ export class SessionStateStore {
   }
 
   resolveAllowedArtifactPath(sessionId: string, targetPath: string): string | null {
+    return this.resolveAllowedArtifactFile(sessionId, targetPath)?.resolved ?? null;
+  }
+
+  private resolveAllowedArtifactFile(
+    sessionId: string,
+    targetPath: string
+  ): { resolved: string; size: number; mtimeMs: number } | null {
     if (!targetPath) return null;
 
     let candidate = targetPath;
@@ -719,22 +837,34 @@ export class SessionStateStore {
       candidate = path.join(SESSION_STATE_DIR, sessionId, "files", candidate);
     }
 
-    let resolved: string;
+    // Artifact references repeat on every refresh of an active session; cache validated results briefly.
+    const cacheKey = path.resolve(candidate).toLowerCase();
+    const now = Date.now();
+    const hit = this.artifactPathCache.get(cacheKey);
+    if (hit && now - hit.checkedAt < (hit.resolved ? 30_000 : 10_000)) {
+      return hit.resolved ? { resolved: hit.resolved, size: hit.size, mtimeMs: hit.mtimeMs } : null;
+    }
+
+    let result: { resolved: string; size: number; mtimeMs: number } | null = null;
     try {
-      resolved = fs.existsSync(candidate) ? fs.realpathSync(candidate) : path.resolve(candidate);
+      const resolved = fs.realpathSync.native(candidate);
+      const stat = fs.statSync(resolved);
+      if (stat.isFile() && this.isAllowedResolvedPath(resolved)) {
+        result = { resolved, size: stat.size, mtimeMs: stat.mtimeMs };
+      }
     } catch {
-      resolved = path.resolve(candidate);
+      result = null;
     }
 
-    if (!fs.existsSync(resolved)) {
-      return null;
-    }
+    if (this.artifactPathCache.size > 5000) this.artifactPathCache.clear();
+    this.artifactPathCache.set(
+      cacheKey,
+      result ? { ...result, checkedAt: now } : { resolved: null, size: 0, mtimeMs: 0, checkedAt: now }
+    );
+    return result;
+  }
 
-    const stat = fs.statSync(resolved);
-    if (!stat.isFile()) {
-      return null;
-    }
-
+  private isAllowedResolvedPath(resolved: string): boolean {
     const lowerResolved = resolved.toLowerCase();
     // Never expose secret token or auth files
     if (
@@ -742,16 +872,14 @@ export class SessionStateStore {
       lowerResolved.includes("\\run\\ws.release.token") ||
       lowerResolved.endsWith("remote-agent-auth.json")
     ) {
-      return null;
+      return false;
     }
 
     const allowedRoots = this.getAllowedRoots();
-    const isAllowed = allowedRoots.some((root) => {
+    return allowedRoots.some((root) => {
       const normRoot = root.toLowerCase();
       return lowerResolved === normRoot || lowerResolved.startsWith(normRoot + path.sep);
     });
-
-    return isAllowed ? resolved : null;
   }
 
   private hasActiveLockFile(sessionFolder: string): boolean {
@@ -1091,15 +1219,12 @@ export class SessionStateStore {
     let subAgents = 0;
     let runningSubAgents = 0;
     const eventsPath = path.join(folder, "events.jsonl");
-    if (fs.existsSync(eventsPath)) {
-      try {
-        const lineInfo = this.getFilteredEventLines(sessionId, eventsPath);
-        subAgents = lineInfo.subAgentsStarted;
-        if (this.hasActiveLockFile(folder) && subAgents > lineInfo.subAgentsCompleted) {
-          runningSubAgents = subAgents - lineInfo.subAgentsCompleted;
-        }
-      } catch {
-        // Ignore
+    this.indexer.requestScan(sessionId, eventsPath);
+    const eventIndex = this.indexer.get(sessionId);
+    if (eventIndex) {
+      subAgents = eventIndex.subAgentsStarted;
+      if (this.hasActiveLockFile(folder) && eventIndex.subAgentsStarted > eventIndex.subAgentsCompleted) {
+        runningSubAgents = eventIndex.subAgentsStarted - eventIndex.subAgentsCompleted;
       }
     }
     const dsDir = path.join(folder, "detached-shells");
@@ -1167,12 +1292,10 @@ export class SessionStateStore {
     sessionId: string,
     fullPath: string,
     source: ArtifactItem["source"],
-    baseDir?: string
+    baseDir: string | undefined,
+    fileInfo: { size: number; mtimeMs: number }
   ): ArtifactItem | null {
     try {
-      if (!fs.existsSync(fullPath)) return null;
-      const stat = fs.statSync(fullPath);
-      if (!stat.isFile()) return null;
       const { category, mimeType } = classifyFile(fullPath);
       const relativePath = baseDir
         ? path.relative(baseDir, fullPath).replace(/\\/g, "/")
@@ -1185,8 +1308,8 @@ export class SessionStateStore {
         fullPath,
         category,
         mimeType,
-        sizeBytes: stat.size,
-        updatedAt: stat.mtime.toISOString(),
+        sizeBytes: fileInfo.size,
+        updatedAt: new Date(fileInfo.mtimeMs).toISOString(),
         source,
         url: `/api/sessions/${encodeURIComponent(sessionId)}/artifact?path=${encodeURIComponent(fullPath)}`,
       };
@@ -1226,13 +1349,17 @@ export class SessionStateStore {
     }
 
     const existingCache = this.sessionDetailCache.get(sessionId);
-    if (
-      existingCache &&
-      existingCache.eventsSize === eventsSize &&
-      existingCache.eventsMtimeMs === eventsMtimeMs &&
-      Date.now() - existingCache.cachedAt < 180_000
-    ) {
-      return existingCache.data;
+    const indexStamp = this.getIndexStamp(sessionId);
+    if (existingCache) {
+      const age = Date.now() - existingCache.cachedAt;
+      const unchanged =
+        existingCache.eventsSize === eventsSize &&
+        existingCache.eventsMtimeMs === eventsMtimeMs &&
+        existingCache.indexStamp === indexStamp;
+      // Coalesce bursts of refreshes while an agent is writing events continuously.
+      if ((unchanged && age < 180_000) || age < DETAIL_REPARSE_MIN_INTERVAL_MS) {
+        return existingCache.data;
+      }
     }
 
     let sessionCwd = cwd;
@@ -1301,9 +1428,9 @@ export class SessionStateStore {
       if (artifactsByPath.has(normalizedKey)) {
         return artifactsByPath.get(normalizedKey)!;
       }
-      const allowed = this.resolveAllowedArtifactPath(sessionId, fullPath);
+      const allowed = this.resolveAllowedArtifactFile(sessionId, fullPath);
       if (!allowed) return null;
-      const item = this.buildArtifactItem(sessionId, allowed, source, baseDir);
+      const item = this.buildArtifactItem(sessionId, allowed.resolved, source, baseDir, allowed);
       if (item) {
         artifactsByPath.set(normalizedKey, item);
       }
@@ -1381,7 +1508,7 @@ export class SessionStateStore {
 
     if (fs.existsSync(eventsPath)) {
       try {
-        const lines = this.getFilteredEventLines(sessionId, eventsPath).filteredLines;
+        const lines = this.getDetailEventLines(sessionId, eventsPath);
 
         for (const line of lines) {
           let ev: {
@@ -1844,12 +1971,19 @@ export class SessionStateStore {
       reasoningEffort,
       sessionCwd,
     };
+    this.sessionDetailCache.delete(sessionId);
     this.sessionDetailCache.set(sessionId, {
       eventsSize,
       eventsMtimeMs,
+      indexStamp,
       cachedAt: Date.now(),
       data: resultData,
     });
+    while (this.sessionDetailCache.size > DETAIL_MAX_PARSED_SESSIONS) {
+      const oldest = this.sessionDetailCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.sessionDetailCache.delete(oldest);
+    }
     return resultData;
   }
 

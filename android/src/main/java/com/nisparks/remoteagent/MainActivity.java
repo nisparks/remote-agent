@@ -5,30 +5,46 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
-import android.os.Build;
+import android.net.http.SslError;
 import android.os.Bundle;
-import android.view.Gravity;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.view.KeyEvent;
-import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
+import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
-import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "RemoteAgentPrefs";
@@ -39,10 +55,39 @@ public class MainActivity extends Activity {
     private static final String KEY_HOSTS_JSON = "saved_hosts_json";
     private static final String KEY_KEEP_AWAKE = "keep_awake";
     private static final int FILE_CHOOSER_RESULT_CODE = 1001;
+    private static final int PROBE_TIMEOUT_MS = 3000;
+    private static final long PREFERRED_ENDPOINT_WAIT_MS = 3500;
+    private static final long[] RETRY_DELAYS_MS = {2000, 4000, 8000, 15000, 30000};
+    private static final String LOCAL_PAGE_BASE = "http://localhost/";
 
+    private FrameLayout root;
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
     private SharedPreferences prefs;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService probeExecutor = Executors.newCachedThreadPool();
+    private ConnectivityManager.NetworkCallback networkCallback;
+
+    // Endpoint whose web app is currently loaded; null while a native status/settings page is shown.
+    private String currentBase = null;
+    private volatile String currentPageUrl = "";
+    private String localPageKind = null;
+    private boolean connectInFlight = false;
+    private int retryAttempt = 0;
+    private Runnable pendingRetry = null;
+    private long lastSwitchCheckMs = 0;
+
+    private static final class ProbeResult {
+        final String base;
+        final boolean ok;
+        final String error;
+
+        ProbeResult(String base, boolean ok, String error) {
+            this.base = base;
+            this.ok = ok;
+            this.error = error;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,34 +103,46 @@ public class MainActivity extends Activity {
         handleDeepLink(getIntent());
         applyKeepAwake(prefs.getBoolean(KEY_KEEP_AWAKE, true));
 
-        FrameLayout root = new FrameLayout(this);
+        root = new FrameLayout(this);
         root.setBackgroundColor(Color.parseColor("#0B0F19"));
-
-        webView = new WebView(this);
-        setupWebView();
-        root.addView(webView, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-        ));
-
         setContentView(root);
-        connectImmediateOrAuto();
+        createWebView();
+        registerNetworkCallback();
+        connectBest(true);
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleDeepLink(intent);
-        connectImmediateOrAuto();
+        if (handleDeepLink(intent)) {
+            connectBest(true);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) {
+        if (webView == null) return;
+        if (currentBase != null) {
+            // The web app reconnects its own WebSocket and refreshes data; reloading here would
+            // drop in-progress state such as a photo chosen in the file picker.
             webView.evaluateJavascript("if(window.__onAppResume) window.__onAppResume();", null);
+        } else if (!"settings".equals(localPageKind)) {
+            connectBest(true);
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        unregisterNetworkCallback();
+        handler.removeCallbacksAndMessages(null);
+        probeExecutor.shutdownNow();
+        if (webView != null) {
+            webView.destroy();
+            webView = null;
+        }
+        super.onDestroy();
     }
 
     private void initDefaultsIfEmpty() {
@@ -94,15 +151,12 @@ public class MainActivity extends Activity {
         String defaultToken = getString(R.string.default_token);
 
         SharedPreferences.Editor ed = prefs.edit();
-        // When an APK is built with embedded local/WAN defaults, always refresh SharedPreferences so stale URLs/tokens are replaced
+        // A pre-paired APK refreshes stored endpoints/token so stale values from older installs are replaced.
         if (defaultLan != null && !defaultLan.isEmpty()) {
             ed.putString(KEY_LAN_URL, defaultLan);
         }
         if (defaultWan != null && !defaultWan.isEmpty()) {
             ed.putString(KEY_WAN_URL, defaultWan);
-            ed.putString(KEY_LAST_GOOD_URL, defaultWan);
-        } else if (defaultLan != null && !defaultLan.isEmpty()) {
-            ed.putString(KEY_LAST_GOOD_URL, defaultLan);
         }
         if (defaultToken != null && !defaultToken.isEmpty()) {
             ed.putString(KEY_TOKEN, defaultToken);
@@ -110,68 +164,22 @@ public class MainActivity extends Activity {
         ed.apply();
     }
 
-    private void connectImmediateOrAuto() {
-        final String lastGood = prefs.getString(KEY_LAST_GOOD_URL, "");
-        final String wanUrl = prefs.getString(KEY_WAN_URL, "");
-        final String lanUrl = prefs.getString(KEY_LAN_URL, "");
-        final String token = prefs.getString(KEY_TOKEN, "");
-
-        final String immediateTarget = (lastGood != null && !lastGood.isEmpty())
-                ? lastGood
-                : ((wanUrl != null && !wanUrl.isEmpty()) ? wanUrl : lanUrl);
-
-        if (immediateTarget != null && !immediateTarget.isEmpty()) {
-            loadEndpointWithToken(immediateTarget, token);
-            // Parallel 1.5s health verification: if immediateTarget doesn't respond, seamlessly switch to whichever endpoint is alive!
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    if (probeEndpoint(immediateTarget)) {
-                        return;
-                    }
-                    String fallback = null;
-                    if (lanUrl != null && !lanUrl.isEmpty() && !lanUrl.equals(immediateTarget) && probeEndpoint(lanUrl)) {
-                        fallback = lanUrl;
-                    } else if (wanUrl != null && !wanUrl.isEmpty() && !wanUrl.equals(immediateTarget) && probeEndpoint(wanUrl)) {
-                        fallback = wanUrl;
-                    }
-                    final String nextTarget = fallback;
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (nextTarget != null) {
-                                prefs.edit().putString(KEY_LAST_GOOD_URL, nextTarget).apply();
-                                loadEndpointWithToken(nextTarget, token);
-                            } else {
-                                showConnectionManagerHtml();
-                            }
-                        }
-                    });
-                }
-            }).start();
-        } else {
-            autoConnectBestEndpoint();
-        }
+    private boolean handleDeepLink(Intent intent) {
+        if (intent == null) return false;
+        return applyPairingUri(intent.getData());
     }
 
-    private void handleDeepLink(Intent intent) {
-        if (intent == null || intent.getData() == null) return;
-        Uri uri = intent.getData();
-        if ("remoteagent".equalsIgnoreCase(uri.getScheme())) {
-            SharedPreferences.Editor ed = prefs.edit();
-            String lan = uri.getQueryParameter("lan");
-            String wan = uri.getQueryParameter("wan");
-            String token = uri.getQueryParameter("token");
-            if (lan != null && !lan.isEmpty()) ed.putString(KEY_LAN_URL, lan);
-            if (wan != null && !wan.isEmpty()) {
-                ed.putString(KEY_WAN_URL, wan);
-                ed.putString(KEY_LAST_GOOD_URL, wan);
-            } else if (lan != null && !lan.isEmpty()) {
-                ed.putString(KEY_LAST_GOOD_URL, lan);
-            }
-            if (token != null && !token.isEmpty()) ed.putString(KEY_TOKEN, token);
-            ed.apply();
-        }
+    private boolean applyPairingUri(Uri uri) {
+        if (uri == null || !"remoteagent".equalsIgnoreCase(uri.getScheme())) return false;
+        SharedPreferences.Editor ed = prefs.edit();
+        String lan = uri.getQueryParameter("lan");
+        String wan = uri.getQueryParameter("wan");
+        String token = uri.getQueryParameter("token");
+        if (lan != null && !lan.isEmpty()) ed.putString(KEY_LAN_URL, normalizeEndpointUrl(lan));
+        if (wan != null && !wan.isEmpty()) ed.putString(KEY_WAN_URL, normalizeEndpointUrl(wan));
+        if (token != null && !token.isEmpty()) ed.putString(KEY_TOKEN, token);
+        ed.apply();
+        return true;
     }
 
     private void applyKeepAwake(boolean keepAwake) {
@@ -182,51 +190,93 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void setupWebView() {
+    private void createWebView() {
+        webView = new WebView(this);
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
-        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
-        }
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         CookieManager.getInstance().setAcceptCookie(true);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false);
 
         webView.setBackgroundColor(Color.parseColor("#0B0F19"));
         webView.addJavascriptInterface(new AndroidBridge(), "AndroidNative");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                currentPageUrl = url != null ? url : "";
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                if (url != null && (url.startsWith("http://") || url.startsWith("https://")) && !url.startsWith("http://localhost")) {
-                    String base = url.split("\\?")[0].replaceAll("/+$", "");
-                    prefs.edit().putString(KEY_LAST_GOOD_URL, base).apply();
+                // Native status pages must not remain in back history behind the loaded app.
+                if (localPageKind == null && url != null && !url.startsWith(LOCAL_PAGE_BASE)) {
+                    view.clearHistory();
                 }
             }
 
             @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request != null && request.isForMainFrame()) {
-                    String failedUrl = request.getUrl() != null ? request.getUrl().toString() : "";
-                    String wanUrl = prefs.getString(KEY_WAN_URL, "");
-                    String lanUrl = prefs.getString(KEY_LAN_URL, "");
-                    String token = prefs.getString(KEY_TOKEN, "");
-                    if (wanUrl != null && !wanUrl.isEmpty() && !failedUrl.startsWith(wanUrl)) {
-                        loadEndpointWithToken(wanUrl, token);
-                        return;
-                    }
-                    if (lanUrl != null && !lanUrl.isEmpty() && !failedUrl.startsWith(lanUrl)) {
-                        loadEndpointWithToken(lanUrl, token);
-                        return;
-                    }
-                    showConnectionManagerHtml();
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri uri = request.getUrl();
+                if (uri == null) return false;
+                if ("remoteagent".equalsIgnoreCase(uri.getScheme())) {
+                    applyPairingUri(uri);
+                    connectBest(true);
+                    return true;
                 }
+                String url = uri.toString();
+                if (request.isForMainFrame() && !isTrustedUrl(url)) {
+                    // Keep untrusted pages out of this WebView: it exposes the AndroidNative bridge.
+                    openExternally(url);
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                if (request == null || !request.isForMainFrame()) return;
+                if (request.getUrl() != null && request.getUrl().toString().startsWith(LOCAL_PAGE_BASE)) return;
+                String reason = error != null && error.getDescription() != null
+                        ? error.getDescription().toString()
+                        : "Network error";
+                onEndpointFailed(reason);
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
+                if (request == null || !request.isForMainFrame() || response == null) return;
+                if (response.getStatusCode() >= 500) {
+                    onEndpointFailed("Desktop server error (HTTP " + response.getStatusCode() + ")");
+                }
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler sslHandler, SslError error) {
+                sslHandler.cancel();
+                onEndpointFailed("The remote URL's HTTPS certificate is invalid or expired");
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                // Android may kill the WebView renderer under memory pressure; rebuild instead of crashing.
+                if (webView != null) {
+                    root.removeView(webView);
+                    webView.destroy();
+                    webView = null;
+                }
+                currentBase = null;
+                createWebView();
+                connectBest(true);
+                return true;
             }
         });
 
@@ -240,20 +290,20 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean onShowFileChooser(
-                    WebView webView,
-                    ValueCallback<Uri[]> filePathCallback,
+                    WebView view,
+                    ValueCallback<Uri[]> callback,
                     FileChooserParams fileChooserParams
             ) {
-                if (MainActivity.this.filePathCallback != null) {
-                    MainActivity.this.filePathCallback.onReceiveValue(null);
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
                 }
-                MainActivity.this.filePathCallback = filePathCallback;
+                filePathCallback = callback;
 
                 Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
                 intent.addCategory(Intent.CATEGORY_OPENABLE);
                 intent.setType("*/*");
-                String[] mimeTypes = new String[]{"image/*", "application/pdf", "text/*"};
-                intent.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes);
+                intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "application/pdf", "text/*"});
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
                 startActivityForResult(Intent.createChooser(intent, "Attach Photo or File"), FILE_CHOOSER_RESULT_CODE);
                 return true;
             }
@@ -262,68 +312,240 @@ public class MainActivity extends Activity {
         webView.setDownloadListener(new DownloadListener() {
             @Override
             public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
-                try {
-                    Intent i = new Intent(Intent.ACTION_VIEW);
-                    i.setData(Uri.parse(url));
-                    startActivity(i);
-                } catch (Exception e) {
-                    Toast.makeText(MainActivity.this, "Cannot open download URL", Toast.LENGTH_SHORT).show();
-                }
+                openExternally(url);
+            }
+        });
+
+        root.addView(webView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+        ));
+    }
+
+    private void openExternally(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (Exception e) {
+            Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // --- Endpoint selection -------------------------------------------------------------
+
+    /** Remote HTTPS first: it works on cellular and (via hairpin NAT) at home, so the page origin stays stable. */
+    private List<String> candidateEndpoints() {
+        LinkedHashSet<String> ordered = new LinkedHashSet<>();
+        addCandidate(ordered, prefs.getString(KEY_WAN_URL, ""));
+        addCandidate(ordered, prefs.getString(KEY_LAN_URL, ""));
+        addCandidate(ordered, prefs.getString(KEY_LAST_GOOD_URL, ""));
+        return new ArrayList<>(ordered);
+    }
+
+    private void addCandidate(LinkedHashSet<String> set, String raw) {
+        String clean = normalizeEndpointUrl(raw);
+        if (!clean.isEmpty()) set.add(clean);
+    }
+
+    private void connectBest(boolean showSpinnerIfIdle) {
+        if (connectInFlight) return;
+        cancelPendingRetry();
+        final List<String> candidates = candidateEndpoints();
+        if (candidates.isEmpty()) {
+            showConnectionManagerHtml();
+            return;
+        }
+        connectInFlight = true;
+        if (currentBase == null && showSpinnerIfIdle) {
+            showStatusPage("Connecting to your desktop…", "", 0);
+        }
+        probeExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                final List<ProbeResult> results = probeInPreferenceOrder(candidates);
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        connectInFlight = false;
+                        for (ProbeResult r : results) {
+                            if (r.ok) {
+                                retryAttempt = 0;
+                                loadBase(r.base);
+                                return;
+                            }
+                        }
+                        currentBase = null;
+                        long delay = nextRetryDelay();
+                        showStatusPage("Can't reach your desktop", summarize(results), delay);
+                        scheduleRetry(delay);
+                    }
+                });
             }
         });
     }
 
-    private void autoConnectBestEndpoint() {
-        final String lanUrl = prefs.getString(KEY_LAN_URL, "");
-        final String wanUrl = prefs.getString(KEY_WAN_URL, "");
-        final String token = prefs.getString(KEY_TOKEN, "");
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                String chosen = null;
-                if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
-                    chosen = lanUrl;
-                } else if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
-                    chosen = wanUrl;
+    private List<ProbeResult> probeInPreferenceOrder(List<String> candidates) {
+        List<Future<ProbeResult>> futures = new ArrayList<>();
+        for (final String base : candidates) {
+            futures.add(probeExecutor.submit(new Callable<ProbeResult>() {
+                @Override
+                public ProbeResult call() {
+                    return probe(base);
                 }
-
-                final String target = chosen;
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (target != null) {
-                            loadEndpointWithToken(target, token);
-                        } else {
-                            showConnectionManagerHtml();
-                        }
-                    }
-                });
+            }));
+        }
+        List<ProbeResult> results = new ArrayList<>();
+        long deadline = SystemClock.elapsedRealtime() + PREFERRED_ENDPOINT_WAIT_MS + PROBE_TIMEOUT_MS;
+        for (int i = 0; i < futures.size(); i++) {
+            String base = candidates.get(i);
+            try {
+                long wait = i == 0
+                        ? PREFERRED_ENDPOINT_WAIT_MS
+                        : Math.max(100, deadline - SystemClock.elapsedRealtime());
+                ProbeResult r = futures.get(i).get(wait, TimeUnit.MILLISECONDS);
+                results.add(r);
+                if (r.ok) break;
+            } catch (Exception e) {
+                results.add(new ProbeResult(base, false, "timed out"));
             }
-        }).start();
+        }
+        return results;
     }
 
-    private boolean probeEndpoint(String baseUrl) {
+    private ProbeResult probe(String base) {
         HttpURLConnection conn = null;
         try {
-            String clean = normalizeEndpointUrl(baseUrl).split("\\?")[0].replaceAll("/+$", "");
-            URL url = new URL(clean + "/api/health");
+            URL url = new URL(base + "/api/health");
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(2200);
-            conn.setReadTimeout(2200);
+            conn.setConnectTimeout(PROBE_TIMEOUT_MS);
+            conn.setReadTimeout(PROBE_TIMEOUT_MS);
+            conn.setUseCaches(false);
             conn.setRequestMethod("GET");
             int code = conn.getResponseCode();
-            return code >= 200 && code < 500;
+            if (code != 200) return new ProbeResult(base, false, "HTTP " + code);
+            StringBuilder body = new StringBuilder();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null && body.length() < 4096) body.append(line);
+            reader.close();
+            boolean ok = body.toString().contains("\"ok\":true");
+            return new ProbeResult(base, ok, ok ? "" : "unexpected response");
+        } catch (javax.net.ssl.SSLException e) {
+            return new ProbeResult(base, false, "certificate error");
+        } catch (java.net.SocketTimeoutException e) {
+            return new ProbeResult(base, false, "timed out");
+        } catch (java.net.UnknownHostException e) {
+            return new ProbeResult(base, false, "DNS lookup failed");
+        } catch (java.net.ConnectException e) {
+            return new ProbeResult(base, false, "connection refused");
         } catch (Exception e) {
-            return false;
+            return new ProbeResult(base, false, e.getClass().getSimpleName());
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
+    private String summarize(List<ProbeResult> results) {
+        StringBuilder sb = new StringBuilder();
+        String wan = normalizeEndpointUrl(prefs.getString(KEY_WAN_URL, ""));
+        for (ProbeResult r : results) {
+            if (sb.length() > 0) sb.append(" • ");
+            String label = r.base.equals(wan) ? "Remote" : (r.base.startsWith("http://") ? "Home Wi-Fi" : "Saved URL");
+            sb.append(label).append(": ").append(r.error);
+        }
+        return sb.toString();
+    }
+
+    private long nextRetryDelay() {
+        return RETRY_DELAYS_MS[Math.min(retryAttempt, RETRY_DELAYS_MS.length - 1)];
+    }
+
+    private void scheduleRetry(long delayMs) {
+        cancelPendingRetry();
+        retryAttempt++;
+        pendingRetry = new Runnable() {
+            @Override
+            public void run() {
+                pendingRetry = null;
+                connectBest(false);
+            }
+        };
+        handler.postDelayed(pendingRetry, delayMs);
+    }
+
+    private void cancelPendingRetry() {
+        if (pendingRetry != null) {
+            handler.removeCallbacks(pendingRetry);
+            pendingRetry = null;
+        }
+    }
+
+    private void onEndpointFailed(String reason) {
+        currentBase = null;
+        long delay = nextRetryDelay();
+        showStatusPage("Can't reach your desktop", reason, delay);
+        scheduleRetry(delay);
+    }
+
+    /** Called when the loaded web app reports it has been offline for a while. */
+    private void maybeSwitchEndpoint() {
+        long now = SystemClock.elapsedRealtime();
+        if (connectInFlight || currentBase == null || now - lastSwitchCheckMs < 15000) return;
+        lastSwitchCheckMs = now;
+        final String current = currentBase;
+        final List<String> candidates = candidateEndpoints();
+        probeExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                if (probe(current).ok) return; // Same endpoint is fine; the page reconnects itself.
+                final List<ProbeResult> results = probeInPreferenceOrder(candidates);
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        for (ProbeResult r : results) {
+                            if (r.ok && !r.base.equals(currentBase)) {
+                                loadBase(r.base);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void loadBase(String base) {
+        cancelPendingRetry();
+        currentBase = base;
+        localPageKind = null;
+        prefs.edit().putString(KEY_LAST_GOOD_URL, base).apply();
+        String token = prefs.getString(KEY_TOKEN, "");
+        String url = (token != null && !token.isEmpty())
+                ? base + "/?token=" + Uri.encode(token)
+                : base + "/";
+        webView.loadUrl(url);
+    }
+
+    private void loadBaseWithExplicitToken(String rawBase, String token) {
+        String base = normalizeEndpointUrl(rawBase);
+        if (base.isEmpty()) {
+            showConnectionManagerHtml();
+            return;
+        }
+        cancelPendingRetry();
+        currentBase = base;
+        localPageKind = null;
+        String url = (token != null && !token.isEmpty())
+                ? base + "/?token=" + Uri.encode(token)
+                : base + "/";
+        webView.loadUrl(url);
+    }
+
     private String normalizeEndpointUrl(String raw) {
         if (raw == null) return "";
-        String clean = raw.trim().replaceAll("/+$", "");
+        String clean = raw.trim();
+        int q = clean.indexOf('?');
+        if (q >= 0) clean = clean.substring(0, q);
+        clean = clean.replaceAll("/+$", "");
         if (clean.isEmpty()) return "";
         if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
             if (clean.startsWith("192.168.") || clean.startsWith("10.") || clean.startsWith("127.")) {
@@ -335,40 +557,128 @@ public class MainActivity extends Activity {
         return clean;
     }
 
-    private void loadEndpointWithToken(String baseUrl, String token) {
-        String clean = normalizeEndpointUrl(baseUrl);
-        if (clean.isEmpty()) {
-            showConnectionManagerHtml();
+    private boolean isTrustedUrl(String url) {
+        if (url == null) return false;
+        String lowerUrl = url.toLowerCase(java.util.Locale.ROOT);
+        if (lowerUrl.startsWith(LOCAL_PAGE_BASE)) return true;
+        for (String base : candidateEndpoints()) {
+            String lowerBase = base.toLowerCase(java.util.Locale.ROOT);
+            if (lowerUrl.equals(lowerBase) || lowerUrl.startsWith(lowerBase + "/")) return true;
+        }
+        return false;
+    }
+
+    // --- Network change notifications ---------------------------------------------------
+
+    private void registerNetworkCallback() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            onNetworkChanged();
+                        }
+                    });
+                }
+
+                @Override
+                public void onLost(Network network) {
+                    handler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (webView != null && currentBase != null) {
+                                webView.evaluateJavascript("if(window.__onNetworkChanged) window.__onNetworkChanged();", null);
+                            }
+                        }
+                    });
+                }
+            };
+            cm.registerDefaultNetworkCallback(networkCallback);
+        } catch (Exception e) {
+            networkCallback = null;
+        }
+    }
+
+    private void unregisterNetworkCallback() {
+        if (networkCallback == null) return;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) cm.unregisterNetworkCallback(networkCallback);
+        } catch (Exception ignored) {
+            // Already unregistered
+        }
+        networkCallback = null;
+    }
+
+    private void onNetworkChanged() {
+        if (webView == null) return;
+        if (currentBase == null) {
+            if (!"settings".equals(localPageKind)) {
+                retryAttempt = 0;
+                connectBest(false);
+            }
             return;
         }
-        webView.clearCache(true);
-        if (clean.contains("?token=")) {
-            webView.loadUrl(clean + "&_t=" + System.currentTimeMillis());
-            return;
-        }
-        String full = (token != null && !token.isEmpty())
-                ? clean + "/?token=" + Uri.encode(token) + "&_t=" + System.currentTimeMillis()
-                : clean + "/?_t=" + System.currentTimeMillis();
-        webView.loadUrl(full);
+        webView.evaluateJavascript("if(window.__onNetworkChanged) window.__onNetworkChanged();", null);
+        // Give the new network a moment, then switch endpoints only if the current one is unreachable.
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                lastSwitchCheckMs = 0;
+                maybeSwitchEndpoint();
+            }
+        }, 3000);
+    }
+
+    // --- Native pages -------------------------------------------------------------------
+
+    private void showStatusPage(String title, String detail, long retryInMs) {
+        localPageKind = "status";
+        String retryScript = retryInMs > 0
+                ? "var left=" + (retryInMs / 1000) + ";var el=document.getElementById('cd');"
+                + "function tick(){el.textContent=left>0?('Retrying automatically in '+left+'s'):'Retrying…';left--;}"
+                + "tick();setInterval(tick,1000);"
+                : "document.getElementById('cd').textContent='';";
+        String html = "<!DOCTYPE html><html><head>"
+                + "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'/>"
+                + "<style>"
+                + "body{margin:0;padding:32px 20px;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;box-sizing:border-box;}"
+                + ".card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:22px 20px;}"
+                + "h2{margin:0 0 8px;font-size:19px;}"
+                + "p{margin:0 0 6px;font-size:13px;color:#8b949e;line-height:1.45;word-break:break-word;}"
+                + "#cd{color:#e3b341;font-size:13px;margin:10px 0 4px;}"
+                + ".btn{display:block;width:100%;padding:12px;margin-top:10px;border-radius:8px;border:none;font-weight:600;font-size:14px;}"
+                + ".primary{background:#1f6feb;color:#fff;}.sec{background:#21262d;color:#e6edf3;border:1px solid #30363d;}"
+                + ".spin{width:18px;height:18px;border:2px solid #30363d;border-top-color:#58a6ff;border-radius:50%;display:inline-block;animation:s 0.8s linear infinite;vertical-align:middle;margin-right:8px;}"
+                + "@keyframes s{to{transform:rotate(360deg)}}"
+                + "</style></head><body><div class='card'>"
+                + "<h2>" + (retryInMs > 0 ? "" : "<span class='spin'></span>") + esc(title) + "</h2>"
+                + (detail != null && !detail.isEmpty() ? "<p>" + esc(detail) + "</p>" : "")
+                + "<p>The app keeps your session paired and reconnects automatically when your desktop is reachable.</p>"
+                + "<div id='cd'></div>"
+                + "<button class='btn primary' onclick='AndroidNative.retryNow()'>Retry now</button>"
+                + "<button class='btn sec' onclick='AndroidNative.openConnectionSettings()'>Connection settings</button>"
+                + "</div><script>" + retryScript + "</script></body></html>";
+        webView.loadDataWithBaseURL(LOCAL_PAGE_BASE, html, "text/html", "UTF-8", LOCAL_PAGE_BASE);
     }
 
     private void showConnectionManagerHtml() {
+        cancelPendingRetry();
+        currentBase = null;
+        localPageKind = "settings";
         String lan = esc(prefs.getString(KEY_LAN_URL, ""));
-        String wanPref = prefs.getString(KEY_WAN_URL, "");
-        if (wanPref == null) {
-            wanPref = "";
-        }
-        String wan = esc(wanPref);
-        String tok = esc(prefs.getString(KEY_TOKEN, ""));
+        String wan = esc(prefs.getString(KEY_WAN_URL, ""));
 
         String html = "<!DOCTYPE html><html><head>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'/>"
                 + "<style>"
                 + "body{margin:0;padding:24px 18px;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;box-sizing:border-box;}"
                 + ".card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:22px 20px;}"
-                + ".hdr{display:flex;align-items:center;gap:12px;margin-bottom:10px;}"
-                + ".badge{font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;background:rgba(34,197,94,0.16);color:#4ade80;border:1px solid rgba(34,197,94,0.35);}"
-                + "h2{margin:0;font-size:20px;color:#e6edf3;letter-spacing:-0.01em;}"
+                + "h2{margin:0 0 10px;font-size:20px;color:#e6edf3;letter-spacing:-0.01em;}"
                 + "p{margin:0 0 16px;font-size:13px;color:#8b949e;line-height:1.45;}"
                 + "label{display:block;font-size:12px;font-weight:600;color:#c9d1d9;margin:12px 0 5px;}"
                 + "input{width:100%;box-sizing:border-box;padding:11px 13px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#fff;font-size:14px;outline:none;}"
@@ -380,18 +690,18 @@ public class MainActivity extends Activity {
                 + "#st{margin-top:12px;font-size:12.5px;color:#58a6ff;text-align:center;display:none;}"
                 + "</style></head><body>"
                 + "<div class='card'>"
-                + "<div class='hdr'><h2>Copilot Remote Agent</h2><span class='badge'>TLS READY</span></div>"
-                + "<p>Paste your Pairing URL, or enter your Desktop's WAN / LAN URL and the 6-digit MFA code shown on your Desktop.</p>"
-                + "<label>Remote WAN HTTPS URL (5G / Anywhere)</label>"
+                + "<h2>Connection settings</h2>"
+                + "<p>Paste your Pairing URL, or enter your desktop's remote and home Wi-Fi URLs. Leave the code blank to keep your current pairing.</p>"
+                + "<label>Remote HTTPS URL (cellular / anywhere)</label>"
                 + "<input id='wan' value='" + wan + "' placeholder='https://remote.example.com:4321' />"
-                + "<label>Desktop LAN URL (Home Wi-Fi)</label>"
+                + "<label>Desktop LAN URL (home Wi-Fi)</label>"
                 + "<input id='lan' value='" + lan + "' placeholder='http://192.168.1.100:4321' />"
-                + "<label>6-Digit MFA Code or Pairing Token</label>"
-                + "<input id='tok' value='" + tok + "' placeholder='6-digit MFA code (e.g. 482910) or token' />"
+                + "<label>6-digit code or pairing token (optional)</label>"
+                + "<input id='tok' value='' placeholder='Leave blank to keep the saved pairing' autocomplete='off' />"
                 + "<div id='st'>Connecting to Desktop...</div>"
-                + "<button class='btn btn-wan' onclick='connWan()'>Connect via HTTPS WAN</button>"
-                + "<button class='btn btn-primary' onclick='connLan()'>Connect via Local LAN</button>"
-                + "<button class='btn btn-sec' onclick='autoConn()'>Auto-Select Best Endpoint</button>"
+                + "<button class='btn btn-wan' onclick='autoConn()'>Save &amp; connect</button>"
+                + "<button class='btn btn-primary' onclick='connLan()'>Use home Wi-Fi URL now</button>"
+                + "<button class='btn btn-sec' onclick='connWan()'>Use remote URL now</button>"
                 + "</div>"
                 + "<script>"
                 + "function showSt(msg){var el=document.getElementById('st');el.style.display='block';el.textContent=msg;}"
@@ -405,13 +715,12 @@ public class MainActivity extends Activity {
                 + "  AndroidNative.saveConfig(l,w,t);"
                 + "  return {l:l,w:w,t:t};"
                 + "}"
-                + "function connLan(){var c=parseAndSave();showSt('Connecting to LAN...');AndroidNative.connectTo(c.l,c.t);}"
-                + "function connWan(){var c=parseAndSave();showSt('Connecting to HTTPS WAN...');AndroidNative.connectTo(c.w||c.l,c.t);}"
-                + "function autoConn(){parseAndSave();showSt('Probing LAN & WAN endpoints...');AndroidNative.autoConnect();}"
-                + "setInterval(function(){if(document.activeElement&&document.activeElement.tagName==='INPUT')return;AndroidNative.silentAutoRecover();},4000);"
+                + "function connLan(){var c=parseAndSave();showSt('Connecting to home Wi-Fi URL...');AndroidNative.connectTo(c.l,c.t);}"
+                + "function connWan(){var c=parseAndSave();showSt('Connecting to remote URL...');AndroidNative.connectTo(c.w||c.l,c.t);}"
+                + "function autoConn(){var c=parseAndSave();showSt('Finding the best connection...');if(/^\\d{6}$/.test(c.t)){AndroidNative.connectTo(c.w||c.l,c.t);}else{AndroidNative.autoConnect();}}"
                 + "</script></body></html>";
 
-        webView.loadDataWithBaseURL("http://localhost/", html, "text/html", "UTF-8", null);
+        webView.loadDataWithBaseURL(LOCAL_PAGE_BASE, html, "text/html", "UTF-8", LOCAL_PAGE_BASE);
     }
 
     private String esc(String s) {
@@ -425,9 +734,14 @@ public class MainActivity extends Activity {
             if (filePathCallback == null) return;
             Uri[] results = null;
             if (resultCode == Activity.RESULT_OK && data != null) {
-                String dataString = data.getDataString();
-                if (dataString != null) {
-                    results = new Uri[]{Uri.parse(dataString)};
+                if (data.getClipData() != null) {
+                    int count = data.getClipData().getItemCount();
+                    results = new Uri[count];
+                    for (int i = 0; i < count; i++) {
+                        results[i] = data.getClipData().getItemAt(i).getUri();
+                    }
+                } else if (data.getDataString() != null) {
+                    results = new Uri[]{Uri.parse(data.getDataString())};
                 }
             }
             filePathCallback.onReceiveValue(results);
@@ -440,9 +754,12 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (webView != null) {
-            String currentUrl = webView.getUrl();
-            if (currentUrl != null && currentUrl.startsWith("http://localhost")) {
-                connectImmediateOrAuto();
+            if ("settings".equals(localPageKind)) {
+                connectBest(true);
+                return;
+            }
+            if (localPageKind != null) {
+                super.onBackPressed();
                 return;
             }
             webView.evaluateJavascript(
@@ -453,7 +770,7 @@ public class MainActivity extends Activity {
                             if ("true".equals(value)) {
                                 return;
                             }
-                            if (webView.canGoBack()) {
+                            if (webView != null && webView.canGoBack()) {
                                 webView.goBack();
                             } else {
                                 MainActivity.super.onBackPressed();
@@ -476,13 +793,18 @@ public class MainActivity extends Activity {
     }
 
     public class AndroidBridge {
+        private boolean trusted() {
+            return isTrustedUrl(currentPageUrl);
+        }
+
         @JavascriptInterface
-        public void saveConfig(String lanUrl, String wanUrl, String token) {
+        public void saveConfig(final String lanUrl, final String wanUrl, final String token) {
+            if (!trusted()) return;
             SharedPreferences.Editor ed = prefs.edit();
-            if (lanUrl != null) ed.putString(KEY_LAN_URL, lanUrl.trim());
-            if (wanUrl != null) ed.putString(KEY_WAN_URL, wanUrl.trim());
-            // Do not overwrite KEY_TOKEN with a 30-second 6-digit MFA code; initTokenFromUrl() will sync the exchanged 30-day token via syncEndpoints()
-            if (token != null && !token.trim().matches("^\\d{6}$")) {
+            if (lanUrl != null) ed.putString(KEY_LAN_URL, normalizeEndpointUrl(lanUrl));
+            if (wanUrl != null) ed.putString(KEY_WAN_URL, normalizeEndpointUrl(wanUrl));
+            // Never persist a short-lived 6-digit code; the web app exchanges it and syncs the resulting token.
+            if (token != null && !token.trim().isEmpty() && !token.trim().matches("^\\d{6}$")) {
                 ed.putString(KEY_TOKEN, token.trim());
             }
             ed.apply();
@@ -490,16 +812,14 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void syncEndpoints(String lanUrl, String wanUrl, String token) {
+            if (!trusted()) return;
             SharedPreferences.Editor ed = prefs.edit();
-            if (lanUrl != null && !lanUrl.isEmpty()) ed.putString(KEY_LAN_URL, lanUrl.trim());
-            if (wanUrl != null && !wanUrl.isEmpty()) {
-                ed.putString(KEY_WAN_URL, wanUrl.trim());
-                ed.putString(KEY_LAST_GOOD_URL, wanUrl.trim());
-            }
+            if (lanUrl != null && !lanUrl.isEmpty()) ed.putString(KEY_LAN_URL, normalizeEndpointUrl(lanUrl));
+            if (wanUrl != null && !wanUrl.isEmpty()) ed.putString(KEY_WAN_URL, normalizeEndpointUrl(wanUrl));
             if (token != null && !token.isEmpty()) {
                 String cleanTok = token.trim();
                 String existingTok = prefs.getString(KEY_TOKEN, "");
-                // Never overwrite a permanent master pairing token with a temporary tmp_ token
+                // Never overwrite a permanent pairing token with a temporary tmp_ session token
                 if (existingTok == null || existingTok.isEmpty() || existingTok.startsWith("tmp_") || !cleanTok.startsWith("tmp_")) {
                     ed.putString(KEY_TOKEN, cleanTok);
                 }
@@ -509,66 +829,71 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public String getSavedToken() {
-            return prefs.getString(KEY_TOKEN, "");
+            return trusted() ? prefs.getString(KEY_TOKEN, "") : "";
+        }
+
+        @JavascriptInterface
+        public void reportConnectionState(final String state) {
+            if (!trusted()) return;
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if ("offline".equals(state)) {
+                        maybeSwitchEndpoint();
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void retryNow() {
+            if (!trusted()) return;
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    retryAttempt = 0;
+                    connectBest(true);
+                }
+            });
         }
 
         @JavascriptInterface
         public void silentAutoRecover() {
-            final String lanUrl = prefs.getString(KEY_LAN_URL, "");
-            final String wanUrl = prefs.getString(KEY_WAN_URL, "");
-            final String token = prefs.getString(KEY_TOKEN, "");
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    String chosen = null;
-                    if (lanUrl != null && !lanUrl.isEmpty() && probeEndpoint(lanUrl)) {
-                        chosen = lanUrl;
-                    } else if (wanUrl != null && !wanUrl.isEmpty() && probeEndpoint(wanUrl)) {
-                        chosen = wanUrl;
-                    }
-                    final String target = chosen;
-                    if (target != null) {
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                loadEndpointWithToken(target, token);
-                            }
-                        });
-                    }
-                }
-            }).start();
+            retryNow();
         }
 
         @JavascriptInterface
         public String getSavedHostsJson() {
-            return prefs.getString(KEY_HOSTS_JSON, "[]");
+            return trusted() ? prefs.getString(KEY_HOSTS_JSON, "[]") : "[]";
         }
 
         @JavascriptInterface
         public void saveHostsJson(String json) {
-            if (json != null) {
+            if (trusted() && json != null) {
                 prefs.edit().putString(KEY_HOSTS_JSON, json).apply();
             }
         }
 
         @JavascriptInterface
         public void connectTo(final String url, final String token) {
-            runOnUiThread(new Runnable() {
+            if (!trusted()) return;
+            handler.post(new Runnable() {
                 @Override
                 public void run() {
-                    loadEndpointWithToken(url, token);
+                    loadBaseWithExplicitToken(url, token);
                 }
             });
         }
 
         @JavascriptInterface
         public void autoConnect() {
-            autoConnectBestEndpoint();
+            retryNow();
         }
 
         @JavascriptInterface
         public void openConnectionSettings() {
-            runOnUiThread(new Runnable() {
+            if (!trusted()) return;
+            handler.post(new Runnable() {
                 @Override
                 public void run() {
                     showConnectionManagerHtml();

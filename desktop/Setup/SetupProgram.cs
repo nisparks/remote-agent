@@ -11,7 +11,7 @@ public sealed class InstallOptions
     public string WanMode { get; set; } = "cloudflare"; // "cloudflare" | "custom" | "lan"
     public string CustomWanUrl { get; set; } = "";
     public bool AutoStartLogin { get; set; } = true;
-    public bool EnablePreLoginBootTask { get; set; } = false;
+    public bool EnableUpdateAutoSignIn { get; set; } = false;
     public bool AutoLaunchCopilotDesktop { get; set; } = true;
     public bool ConfigureFirewall { get; set; } = false;
     public bool CreateDesktopShortcut { get; set; } = true;
@@ -233,18 +233,18 @@ internal static class SetupProgram
             // Ignore registry errors
         }
 
-        // 6. Optional Pre-Login OS Boot Task (UAC)
-        if (opts.EnablePreLoginBootTask)
+        // 6. Optional sign-in after Windows Update restarts (ARSO, UAC)
+        if (opts.EnableUpdateAutoSignIn)
         {
             try
             {
-                string scriptPath = Path.Combine(repoRoot, "scripts", "enable-boot-service.ps1");
+                string scriptPath = Path.Combine(repoRoot, "scripts", "enable-update-auto-signin.ps1");
                 if (File.Exists(scriptPath))
                 {
                     Process.Start(new ProcessStartInfo
                     {
                         FileName = "powershell.exe",
-                        Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\" -RepoRoot \"{repoRoot}\"",
+                        Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
                         Verb = "runas",
                         UseShellExecute = true
                     })?.WaitForExit(10000);
@@ -346,7 +346,7 @@ public sealed class InstallerForm : Form
     private readonly TextBox _customWanUrlBox;
 
     private readonly CheckBox _autoStartLoginChk;
-    private readonly CheckBox _preLoginBootChk;
+    private readonly CheckBox _updateAutoSignInChk;
     private readonly CheckBox _autoAppsChk;
     private readonly CheckBox _firewallChk;
     private readonly CheckBox _desktopChk;
@@ -470,9 +470,9 @@ public sealed class InstallerForm : Form
             AutoSize = true
         };
 
-        _preLoginBootChk = new CheckBox
+        _updateAutoSignInChk = new CheckBox
         {
-            Text = "Enable Pre-Login OS Boot Service (AtStartup Scheduled Task — runs before login, UAC)",
+            Text = "Sign in automatically after Windows Update restarts so the bridge comes back (UAC)",
             Checked = false,
             Location = new Point(16, 58),
             AutoSize = true
@@ -513,7 +513,7 @@ public sealed class InstallerForm : Form
         };
 
         startupPanel.Controls.Add(_autoStartLoginChk);
-        startupPanel.Controls.Add(_preLoginBootChk);
+        startupPanel.Controls.Add(_updateAutoSignInChk);
         startupPanel.Controls.Add(_autoAppsChk);
         startupPanel.Controls.Add(_firewallChk);
         startupPanel.Controls.Add(_desktopChk);
@@ -584,7 +584,7 @@ public sealed class InstallerForm : Form
                 WanMode = wanMode,
                 CustomWanUrl = _customWanUrlBox.Text.Trim(),
                 AutoStartLogin = _autoStartLoginChk.Checked,
-                EnablePreLoginBootTask = _preLoginBootChk.Checked,
+                EnableUpdateAutoSignIn = _updateAutoSignInChk.Checked,
                 AutoLaunchCopilotDesktop = _autoAppsChk.Checked,
                 ConfigureFirewall = _firewallChk.Checked,
                 CreateDesktopShortcut = _desktopChk.Checked,

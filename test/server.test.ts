@@ -101,6 +101,11 @@ describe("RemoteAgentServer & Desktop Copilot Bridge", () => {
   });
 
   it("serves the signed Android APK and Windows Desktop Installer via /download/*", async () => {
+    const unauthApk = await fetch(`${baseUrl}/apk`);
+    assert.equal(unauthApk.status, 401, "pre-paired APK must not be public");
+    const unauthDownload = await fetch(`${baseUrl}/download/RemoteAgent-android.apk`);
+    assert.equal(unauthDownload.status, 401);
+
     const apkRes = await fetch(`${baseUrl}/download/RemoteAgent-android.apk?token=${testToken}`);
     assert.equal(apkRes.status, 200);
     assert.equal(apkRes.headers.get("content-type"), "application/vnd.android.package-archive");

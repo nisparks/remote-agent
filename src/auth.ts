@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import QRCode from "qrcode";
+import { logEvent } from "./logger.js";
 
 export interface AuthConfig {
   pairingToken: string;
@@ -73,17 +74,30 @@ function fromBase32(base32: string): Buffer {
 
 const AUTH_FILE_PATH = path.join(os.homedir(), ".copilot", "remote-agent-auth.json");
 
+// The token used by this repository's tests is public, and "sess-recovered-*" grants were minted
+// by a removed auto-heal path that accepted unknown tokens; neither may ever authorize a client.
+const PUBLIC_TEST_TOKENS = new Set(["test-secret-pairing-token-1234567890"]);
+
+function isUntrustedGrant(grant: TempSessionGrant, pairingToken: string): boolean {
+  return (
+    grant.token === pairingToken ||
+    PUBLIC_TEST_TOKENS.has(grant.token) ||
+    String(grant.id || "").startsWith("sess-recovered-")
+  );
+}
+
 export class AuthManager {
   private config: AuthConfig;
+  private readonly authFilePath: string;
   private isEphemeralTestAuth = false;
   private failedAttempts = new Map<string, { count: number; lockedUntil: number }>();
   private approvalRateLimits = new Map<string, { count: number; resetAt: number }>();
   private consumedTotpCodes = new Set<string>();
-  private revokedTokens = new Set<string>();
   private tempSessions = new Map<string, TempSessionGrant>();
   private pendingApprovals = new Map<string, PendingLoginApproval>();
 
-  constructor(customToken?: string) {
+  constructor(customToken?: string, options: { authFilePath?: string } = {}) {
+    this.authFilePath = options.authFilePath || AUTH_FILE_PATH;
     if (customToken) {
       this.isEphemeralTestAuth = true;
       this.config = {
@@ -98,8 +112,8 @@ export class AuthManager {
 
   private loadOrCreateConfig(): AuthConfig {
     try {
-      if (fs.existsSync(AUTH_FILE_PATH)) {
-        const raw = JSON.parse(fs.readFileSync(AUTH_FILE_PATH, "utf8")) as Partial<AuthConfig>;
+      if (fs.existsSync(this.authFilePath)) {
+        const raw = JSON.parse(fs.readFileSync(this.authFilePath, "utf8")) as Partial<AuthConfig>;
         if (raw.pairingToken && raw.pairingToken.length >= 16) {
           const totpSecret =
             raw.totpSecret && raw.totpSecret.length >= 16
@@ -111,16 +125,26 @@ export class AuthManager {
             createdAt: raw.createdAt || new Date().toISOString(),
             tempSessions: Array.isArray(raw.tempSessions) ? raw.tempSessions : [],
           };
+          let droppedGrants = 0;
           for (const ts of loaded.tempSessions || []) {
-            if (ts && ts.token) {
-              // Auto-extend persisted device sessions so paired phones/tablets never unexpectedly disconnect
-              if (new Date(ts.expiresAt).getTime() <= Date.now()) {
-                ts.expiresAt = new Date(Date.now() + 3650 * 24 * 3600_000).toISOString();
-              }
+            const usable =
+              ts &&
+              typeof ts.token === "string" &&
+              ts.token.length > 0 &&
+              new Date(ts.expiresAt).getTime() > Date.now() &&
+              !isUntrustedGrant(ts, loaded.pairingToken);
+            if (usable) {
               this.tempSessions.set(ts.token, ts);
+            } else {
+              droppedGrants++;
             }
           }
-          if (!raw.totpSecret) {
+          if (droppedGrants > 0) {
+            logEvent("warn", "Removed expired or untrusted device grants from the auth config", {
+              removed: droppedGrants,
+            });
+          }
+          if (!raw.totpSecret || droppedGrants > 0) {
             this.saveConfig(loaded);
           }
           return loaded;
@@ -137,8 +161,8 @@ export class AuthManager {
     };
 
     try {
-      fs.mkdirSync(path.dirname(AUTH_FILE_PATH), { recursive: true });
-      fs.writeFileSync(AUTH_FILE_PATH, JSON.stringify(fresh, null, 2), "utf8");
+      fs.mkdirSync(path.dirname(this.authFilePath), { recursive: true });
+      fs.writeFileSync(this.authFilePath, JSON.stringify(fresh, null, 2), "utf8");
     } catch {
       // Ignore write failures in restricted environments
     }
@@ -150,8 +174,8 @@ export class AuthManager {
     if (this.isEphemeralTestAuth) return;
     try {
       cfg.tempSessions = [...this.tempSessions.values()];
-      fs.mkdirSync(path.dirname(AUTH_FILE_PATH), { recursive: true });
-      fs.writeFileSync(AUTH_FILE_PATH, JSON.stringify(cfg, null, 2), "utf8");
+      fs.mkdirSync(path.dirname(this.authFilePath), { recursive: true });
+      fs.writeFileSync(this.authFilePath, JSON.stringify(cfg, null, 2), "utf8");
     } catch {
       // Ignore write failures
     }
@@ -227,14 +251,17 @@ export class AuthManager {
   }
 
   isPrivateLanOrLocalIp(ip: string): boolean {
-    const clean = ip.replace(/^::ffff:/i, "").trim();
+    const clean = ip.replace(/^::ffff:/i, "").trim().toLowerCase();
     return (
-      clean === "127.0.0.1" ||
       clean === "::1" ||
-      clean.startsWith("192.168.") ||
-      clean.startsWith("10.") ||
-      clean.startsWith("100.") ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(clean)
+      /^127\./.test(clean) ||
+      /^10\./.test(clean) ||
+      /^192\.168\./.test(clean) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(clean) ||
+      // Tailscale and carrier-grade NAT use 100.64.0.0/10, not all of 100.0.0.0/8.
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(clean) ||
+      /^f[cd][0-9a-f]{2}:/.test(clean) ||
+      /^fe[89ab][0-9a-f]:/.test(clean)
     );
   }
 
@@ -305,7 +332,7 @@ export class AuthManager {
 
   issueTempSession(params: { label?: string; clientIp: string; durationHours?: number }): TempSessionGrant {
     this.pruneExpiredTempSessions();
-    const hours = Math.max(0.25, Math.min(24 * 30, Number(params.durationHours || 8)));
+    const hours = Math.max(0.25, Math.min(24 * 3650, Number(params.durationHours || 8)));
     const now = Date.now();
     const grant: TempSessionGrant = {
       id: `sess-${crypto.randomBytes(6).toString("hex")}`,
@@ -328,7 +355,6 @@ export class AuthManager {
   revokeTempSession(id: string): boolean {
     for (const [tok, grant] of this.tempSessions.entries()) {
       if (grant.id === id) {
-        this.revokedTokens.add(tok);
         this.tempSessions.delete(tok);
         this.saveConfig();
         return true;
@@ -339,15 +365,15 @@ export class AuthManager {
 
   private pruneExpiredTempSessions(): void {
     const now = Date.now();
+    let removed = false;
     for (const [tok, grant] of this.tempSessions.entries()) {
       if (new Date(grant.expiresAt).getTime() <= now) {
-        if (this.isEphemeralTestAuth) {
-          this.tempSessions.delete(tok);
-        } else {
-          // Automatically roll forward active device leases so paired mobile devices never get stranded
-          grant.expiresAt = new Date(now + 3650 * 24 * 3600_000).toISOString();
-        }
+        this.tempSessions.delete(tok);
+        removed = true;
       }
+    }
+    if (removed) {
+      this.saveConfig();
     }
     for (const [reqId, req] of this.pendingApprovals.entries()) {
       if (now - req.createdAt > 5 * 60_000) {
@@ -398,11 +424,21 @@ export class AuthManager {
   }
 
   getClientIp(req: IncomingMessage): string {
+    const socketIp = req.socket?.remoteAddress || "unknown";
+    // Proxy headers are client-controlled; only trust them from a local reverse proxy/tunnel daemon.
+    if (!this.isLoopbackAddress(socketIp)) {
+      return socketIp;
+    }
     const cfIp = req.headers["cf-connecting-ip"];
     if (typeof cfIp === "string" && cfIp.trim()) return cfIp.trim();
     const xff = req.headers["x-forwarded-for"];
     if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
-    return req.socket?.remoteAddress || "unknown";
+    return socketIp;
+  }
+
+  private isLoopbackAddress(ip: string): boolean {
+    const clean = ip.replace(/^::ffff:/i, "").trim();
+    return clean === "::1" || /^127\./.test(clean);
   }
 
   isLoopbackRequest(req: IncomingMessage): boolean {
@@ -468,37 +504,13 @@ export class AuthManager {
     return null;
   }
 
-  private tryAutoHealDeviceToken(candidate: string, clientIp = "any"): boolean {
-    if (this.isEphemeralTestAuth) return false;
-    if (this.revokedTokens.has(candidate)) return false;
-    // Recognize previously issued tmp_ tokens or 32-char base64url pairing tokens held by an already-paired phone/device
-    if (/^tmp_[A-Za-z0-9_-]{22,36}$/.test(candidate) || /^[A-Za-z0-9_-]{32}$/.test(candidate)) {
-      const now = Date.now();
-      const grant: TempSessionGrant = {
-        id: `sess-recovered-${crypto.createHash("sha1").update(candidate).digest("hex").slice(0, 10)}`,
-        token: candidate,
-        label: "Auto-Recovered Paired Device",
-        clientIp,
-        createdAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + 3650 * 24 * 3600_000).toISOString(),
-      };
-      this.tempSessions.set(candidate, grant);
-      this.saveConfig();
-      return true;
-    }
-    return false;
-  }
-
-  isTokenStringAuthorized(candidate: string, clientIp = "any"): boolean {
+  isTokenStringAuthorized(candidate: string): boolean {
     if (!candidate) return false;
     this.pruneExpiredTempSessions();
     const a = Buffer.from(candidate);
     const b = Buffer.from(this.config.pairingToken);
     const isMasterMatch = a.length === b.length && crypto.timingSafeEqual(a, b);
-    if (isMasterMatch || this.tempSessions.has(candidate)) {
-      return true;
-    }
-    return this.tryAutoHealDeviceToken(candidate, clientIp);
+    return isMasterMatch || this.tempSessions.has(candidate);
   }
 
   isAuthorized(req: IncomingMessage, allowLocalhostBypass = true): boolean {
@@ -511,9 +523,8 @@ export class AuthManager {
       return false;
     }
 
-    const clientIp = this.getClientIp(req);
-    if (this.isTokenStringAuthorized(candidate, clientIp)) {
-      this.clearFailedAttempts(clientIp);
+    if (this.isTokenStringAuthorized(candidate)) {
+      this.clearFailedAttempts(this.getClientIp(req));
       return true;
     }
 

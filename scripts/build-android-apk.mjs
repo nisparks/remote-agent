@@ -204,8 +204,16 @@ execFileSync(
 const alignedApk = path.join(BUILD_DIR, "aligned.apk");
 execFileSync(zipalign, ["-f", "-p", "4", unalignedApk, alignedApk], { stdio: "inherit" });
 
-// 8. Generate signing keystore if not present and sign APK with apksigner
-const keystorePath = path.join(ANDROID_DIR, "debug-release.keystore");
+// 8. Generate signing keystore if not present and sign APK with apksigner.
+// Keep the key outside session worktrees so every rebuild can update the installed app in place.
+const keystorePath =
+  process.env.REMOTE_AGENT_ANDROID_KEYSTORE ||
+  path.join(os.homedir(), ".copilot", "remote-agent-android.keystore");
+const legacyKeystorePath = path.join(ANDROID_DIR, "debug-release.keystore");
+if (!fs.existsSync(keystorePath) && fs.existsSync(legacyKeystorePath)) {
+  fs.mkdirSync(path.dirname(keystorePath), { recursive: true });
+  fs.copyFileSync(legacyKeystorePath, keystorePath);
+}
 if (!fs.existsSync(keystorePath)) {
   execFileSync(
     "keytool",

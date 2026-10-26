@@ -131,19 +131,24 @@ If you run GitHub Copilot across multiple machines (for example, a primary Windo
    - You only need **one** machine exposed to the WAN (via your router's port `4321` or Cloudflare Tunnel).
    - Every additional desktop or server on your local network can stay on **Local LAN Mode (`http://192.168.x.x:4321`)**: when you tap that machine's pill in the mobile drawer while on 5G WAN, your primary desktop transparently reverse-proxies all API calls, artifacts, images, 3D `.stl` models, and steering prompts to the second desktop over your local network with **zero extra router ports or TLS certs required**.
 
-### Step 5: Auto-Start with Windows & Unattended Reboot Recovery
+### Step 5: Auto-Start, Reliability & Unattended Reboot Recovery
 
-1. **Automatic Login Startup (Default)**:
-   - `RemoteAgentDesktop.exe` and `RemoteAgent-Desktop-Setup.exe` automatically register `CopilotRemoteAgent` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`--minimized` to the system tray) and enable Windows `Winlogon\RestartApps = 1` (so Windows automatically restores your desktop session behind the lock screen after a Windows Update reboot).
-   - When `RemoteAgentDesktop.exe` starts, it also automatically launches `github.exe` (GitHub Copilot Desktop) if it is not already running.
-2. **Pre-Login OS Boot Service (Before Windows Login)**:
-   - To make the bridge server (`:4321`) start at **OS boot even before any user logs in** (using a Windows Scheduled Task with `AtStartup` + `S4U` non-interactive logon and Windows ARSO policy), right-click the system tray icon and click **`Enable Pre-Login Boot Service (UAC)`**, or run from an Administrator PowerShell prompt:
-     ```powershell
-     .\scripts\enable-boot-service.ps1
-     ```
-   - **Pre-Login vs. Post-Login Capabilities**:
-     - **Before Login (`Session 0` / Lock Screen)**: Port `4321` (HTTP + Let's Encrypt HTTPS WAN), session browsing, full `events.jsonl` history, images, 3D `.stl` models, Git diffs, and headless `@github/copilot-sdk` (`copilot.exe --server`) session steering are all online immediately.
-     - **After Login (or Windows Update Auto-Restart Sign-On)**: `github.exe`, any companion apps listed in `~/.copilot/remote-agent-startup-apps.json`, and interactive desktop MCP servers attach automatically in `Session 1`.
+1. **Install as an always-on runtime (recommended)**:
+   ```powershell
+   npm install
+   npm run build:desktop
+   npm run deploy:local
+   ```
+   - `deploy:local` copies the bridge to `%LOCALAPPDATA%\CopilotRemoteAgent\runtime`, points the `CopilotRemoteAgent` login entry (`HKCU\...\Run`) at it, and starts the tray app. Running from a stable folder means deleting or archiving a clone/worktree never takes the bridge offline. Re-run it after pulling updates.
+2. **One supervisor, no duplicates**:
+   - `RemoteAgentDesktop.exe` is the only process that starts the bridge server. It is single-instance, checks `/api/health` every 5 seconds, restarts the server only after ~20 seconds of failed checks (with backoff), and never starts a second server while another process owns port `4321`.
+   - When it starts, it also launches `github.exe` (GitHub Copilot Desktop) if it is not already running.
+3. **Finish setup: replace old admin servers + sign in after Windows Update restarts (UAC)**:
+   - Right-click the tray icon → **`Finish setup: replace old admin server & enable restart sign-in (UAC)...`**, or run `scripts\enable-update-auto-signin.ps1` from an Administrator PowerShell. This removes legacy `CopilotRemoteAgent-*` scheduled tasks (and any orphaned server they started) from older versions that could hold the port or start competing servers, then enables Windows ARSO + `RestartApps` so the tray app (and bridge) come back after unattended reboots.
+   - If an older server started with administrator rights is still holding port 4321, the tray app shows a notification; click it and approve the prompt to switch to the updated server.
+4. **Diagnosing disconnects**:
+   - The server logs startups, crashes, event-loop stalls, and WebSocket connects/disconnects (never tokens) to `~\.copilot\logs\remote-agent-server.log` (rotated at 5 MB).
+   - The phone/web app shows a banner while reconnecting and retries with backoff; the Android app prefers the remote HTTPS URL (which also works at home via your router's hairpin NAT) so it does not reload when you move between Wi-Fi and cellular.
 
 ---
 

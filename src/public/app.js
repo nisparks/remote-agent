@@ -165,20 +165,46 @@ function withTokenUrl(url) {
   return `${routed}${sep}token=${encodeURIComponent(state.token)}`;
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15_000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function apiFetch(path, options = {}) {
   const routedPath = resolvePeerPath(path);
+  const { timeoutMs = 15_000, ...fetchOptions } = options;
   const headers = {
-    ...(options.headers || {}),
+    ...(fetchOptions.headers || {}),
   };
   if (state.token) {
     headers["Authorization"] = `Bearer ${state.token}`;
   }
-  if (options.body && typeof options.body === "object") {
+  if (fetchOptions.body && typeof fetchOptions.body === "object") {
     headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify(options.body);
+    fetchOptions.body = JSON.stringify(fetchOptions.body);
   }
-  const res = await fetch(routedPath, { ...options, headers });
+  let res;
+  try {
+    // Requests on a dead mobile connection can otherwise hang for minutes after a network switch.
+    res = await fetchWithTimeout(routedPath, { ...fetchOptions, headers }, timeoutMs);
+  } catch (err) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      setConnectionState("reconnecting");
+      reconnectNow("request-failed");
+    }
+    throw new Error(
+      err && err.name === "AbortError"
+        ? "The desktop took too long to respond. Check your connection and try again."
+        : "Can't reach your desktop right now. Reconnecting…"
+    );
+  }
   if (res.status === 401) {
+    setConnectionState("auth");
     openQrModal(true);
     throw new Error("Unauthorized — please scan the pairing QR code or enter your token.");
   }
@@ -362,79 +388,255 @@ function formatFullMessageTimestamp(iso) {
   return `${datePart} at ${timeStr}${rel ? ` · ${rel}` : ""}`;
 }
 
-// --- WebSocket Live Connection & Persistent Heartbeat ---
-let wsHeartbeatTimer = null;
+// --- WebSocket Live Connection, Heartbeat & Reconnect State Machine ---
+const conn = {
+  state: "connecting", // connecting | online | reconnecting | offline | auth
+  attempt: 0,
+  reconnectTimer: null,
+  heartbeatTimer: null,
+  pongTimer: null,
+  openTimer: null,
+  offlineSince: 0,
+  nextRetryAt: 0,
+  serverStartedAt: null,
+  hadSuccessfulConnection: false,
+  needsFullRefresh: false,
+};
 
-function connectWebSocket() {
+function setConnectionState(next) {
+  if (next === "online") {
+    conn.offlineSince = 0;
+  } else if (!conn.offlineSince) {
+    conn.offlineSince = Date.now();
+  }
+  if (conn.state === next) {
+    renderConnectionBanner();
+    return;
+  }
+  conn.state = next;
+  renderConnectionBanner();
+  updateHostBanner();
+  try {
+    if (window.AndroidNative && typeof window.AndroidNative.reportConnectionState === "function") {
+      window.AndroidNative.reportConnectionState(next);
+    }
+  } catch {}
+}
+
+let connectionBannerTicker = null;
+function renderConnectionBanner() {
+  const banner = document.getElementById("connectionBanner");
+  if (!banner) return;
+  const showFor = ["reconnecting", "offline", "auth"];
+  if (!showFor.includes(conn.state) || (conn.state === "reconnecting" && Date.now() - conn.offlineSince < 2500)) {
+    banner.hidden = true;
+    if (conn.state === "reconnecting" && !connectionBannerTicker) {
+      connectionBannerTicker = setInterval(renderConnectionBanner, 1000);
+    }
+    if (conn.state === "online" && connectionBannerTicker) {
+      clearInterval(connectionBannerTicker);
+      connectionBannerTicker = null;
+    }
+    return;
+  }
+  if (!connectionBannerTicker) connectionBannerTicker = setInterval(renderConnectionBanner, 1000);
+  const secs = Math.max(0, Math.ceil((conn.nextRetryAt - Date.now()) / 1000));
+  let text = "Reconnecting to your desktop…";
+  if (conn.state === "offline") {
+    text = secs > 0 ? `Desktop unreachable — retrying in ${secs}s` : "Desktop unreachable — retrying…";
+  } else if (conn.state === "auth") {
+    text = "This device needs to be paired again";
+  }
+  banner.className = `connection-banner ${conn.state}`;
+  banner.innerHTML = `<span class="connection-banner-dot"></span><span>${escapeHtml(text)}</span>${
+    conn.state === "auth"
+      ? '<button type="button" class="btn btn-sm" data-conn-action="pair">Pair</button>'
+      : '<button type="button" class="btn btn-sm" data-conn-action="retry">Retry now</button>'
+  }`;
+  banner.hidden = false;
+  banner.querySelector("[data-conn-action]")?.addEventListener("click", (e) => {
+    const action = e.currentTarget.getAttribute("data-conn-action");
+    if (action === "pair") {
+      openQrModal(true);
+    } else {
+      reconnectNow("manual");
+    }
+  });
+}
+
+function clearSocketTimers() {
+  for (const key of ["heartbeatTimer", "pongTimer", "openTimer"]) {
+    if (conn[key]) {
+      clearTimeout(conn[key]);
+      clearInterval(conn[key]);
+      conn[key] = null;
+    }
+  }
+}
+
+function scheduleReconnect() {
+  if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
+  // Exponential backoff with jitter: 1s, 2s, 4s ... capped at 20s so mobile recovery stays quick.
+  const base = Math.min(20_000, 1000 * 2 ** Math.min(conn.attempt, 5));
+  const delay = Math.round(base * (0.75 + Math.random() * 0.5));
+  conn.attempt += 1;
+  conn.nextRetryAt = Date.now() + delay;
+  conn.reconnectTimer = setTimeout(() => {
+    conn.reconnectTimer = null;
+    connectWebSocket();
+  }, delay);
+  renderConnectionBanner();
+}
+
+function reconnectNow(reason) {
+  conn.attempt = 0;
+  if (conn.reconnectTimer) {
+    clearTimeout(conn.reconnectTimer);
+    conn.reconnectTimer = null;
+  }
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    // The socket may be half-open after sleep or a network switch; verify it with a quick ping.
+    sendHeartbeat(5000);
+    return;
+  }
+  connectWebSocket(true, reason);
+}
+
+function sendHeartbeat(timeoutMs = 10_000) {
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({ type: "ping" }));
+  } catch {
+    return;
+  }
+  if (conn.pongTimer) clearTimeout(conn.pongTimer);
+  conn.pongTimer = setTimeout(() => {
+    if (state.ws === ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.close(4000, "Heartbeat timeout");
+      } catch {}
+    }
+  }, timeoutMs);
+}
+
+async function probeServerAfterDisconnect() {
+  try {
+    const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+    const res = await fetchWithTimeout(resolvePeerPath("/api/health"), { headers }, 6000);
+    if (!res.ok) return "unreachable";
+    const data = await res.json();
+    return data.authenticated ? "reachable" : "auth";
+  } catch {
+    return "unreachable";
+  }
+}
+
+let refreshAfterReconnectTimer = null;
+function refreshAfterReconnect() {
+  if (refreshAfterReconnectTimer) clearTimeout(refreshAfterReconnectTimer);
+  refreshAfterReconnectTimer = setTimeout(() => {
+    refreshAfterReconnectTimer = null;
+    loadHostStatus();
+    loadSessionsList(!state.activeSessionId);
+    if (state.activeSessionId) {
+      loadSessionDetail(state.activeSessionId, state.stickToBottom);
+    }
+  }, 150);
+}
+
+function connectWebSocket(force = false) {
+  if (
+    !force &&
+    state.ws &&
+    (state.ws.readyState === WebSocket.CONNECTING || state.ws.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
   if (state.ws) {
+    const old = state.ws;
+    state.ws = null;
+    old.onopen = old.onmessage = old.onclose = old.onerror = null;
     try {
-      state.ws.close();
+      old.close();
     } catch {}
   }
-  if (wsHeartbeatTimer) {
-    clearInterval(wsHeartbeatTimer);
-    wsHeartbeatTimer = null;
+  clearSocketTimers();
+  if (conn.state !== "auth") {
+    setConnectionState(conn.hadSuccessfulConnection ? "reconnecting" : "connecting");
   }
+
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = withTokenUrl(`${proto}//${window.location.host}/ws`);
-  const ws = new WebSocket(wsUrl);
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
   state.ws = ws;
 
+  // A connect attempt on a dead mobile network can hang for minutes; fail fast and retry instead.
+  conn.openTimer = setTimeout(() => {
+    if (state.ws === ws && ws.readyState === WebSocket.CONNECTING) {
+      try {
+        ws.close();
+      } catch {}
+    }
+  }, 10_000);
+
   ws.onopen = () => {
-    updateHostBanner();
-    wsHeartbeatTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({ type: "ping" }));
-        } catch {}
-      }
-    }, 15000);
+    if (state.ws !== ws) return;
+    if (conn.openTimer) {
+      clearTimeout(conn.openTimer);
+      conn.openTimer = null;
+    }
+    const wasDisconnected = (conn.hadSuccessfulConnection && conn.state !== "online") || conn.needsFullRefresh;
+    conn.needsFullRefresh = false;
+    conn.attempt = 0;
+    conn.hadSuccessfulConnection = true;
+    setConnectionState("online");
+    conn.heartbeatTimer = setInterval(() => sendHeartbeat(10_000), 15_000);
+    if (wasDisconnected) refreshAfterReconnect();
   };
 
   ws.onmessage = (ev) => {
+    if (state.ws !== ws) return;
     try {
       const msg = JSON.parse(ev.data);
+      if (msg.type === "pong") {
+        if (conn.pongTimer) {
+          clearTimeout(conn.pongTimer);
+          conn.pongTimer = null;
+        }
+        return;
+      }
       handleLiveWsMessage(msg);
     } catch {}
   };
 
-  ws.onclose = () => {
-    if (wsHeartbeatTimer) {
-      clearInterval(wsHeartbeatTimer);
-      wsHeartbeatTimer = null;
-    }
-    setTimeout(async () => {
-      // If we were on a LAN IP and Wi-Fi was turned off (switched to 5G/WAN), auto-failover to WAN URL!
-      const isPrivateLanHost = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(
-        window.location.hostname
-      );
-      const savedWanUrl =
-        state.hostStatus?.wan?.publicUrl || localStorage.getItem("ra_wan_url") || "";
+  ws.onerror = () => {
+    // onclose follows and owns reconnect scheduling
+  };
 
-      if (isPrivateLanHost && savedWanUrl) {
-        try {
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 1800);
-          const r = await fetch("/api/health", { signal: ctrl.signal });
-          clearTimeout(timer);
-          if (r.ok) {
-            connectWebSocket();
-            return;
-          }
-        } catch {
-          // LAN is unreachable — fail over to WAN URL!
-          const tok = state.token || localStorage.getItem("ra_token") || "";
-          if (window.AndroidNative && typeof window.AndroidNative.connectTo === "function") {
-            window.AndroidNative.connectTo(savedWanUrl.replace(/\/+$/, ""), tok);
-            return;
-          }
-          const targetWan = `${savedWanUrl.replace(/\/+$/, "")}/?token=${encodeURIComponent(tok)}`;
-          window.location.href = targetWan;
-          return;
-        }
+  ws.onclose = async () => {
+    if (state.ws !== ws) return;
+    state.ws = null;
+    clearSocketTimers();
+    if (conn.attempt >= 2) {
+      // Repeated failures: distinguish an expired pairing from a network/server outage.
+      const probe = await probeServerAfterDisconnect();
+      if (probe === "auth") {
+        setConnectionState("auth");
+        openQrModal(true);
+        return;
       }
-      connectWebSocket();
-    }, 2500);
+      setConnectionState(probe === "reachable" ? "reconnecting" : "offline");
+    } else {
+      setConnectionState("reconnecting");
+    }
+    scheduleReconnect();
   };
 }
 
@@ -450,6 +652,13 @@ function scheduleActiveSessionRefresh(delay = 300) {
 }
 
 function handleLiveWsMessage(msg) {
+  if (msg.type === "connected" && msg.serverStartedAt) {
+    // The desktop server restarted while we were away; refetch anything we may have missed.
+    if (conn.serverStartedAt && conn.serverStartedAt !== msg.serverStartedAt) {
+      refreshAfterReconnect();
+    }
+    conn.serverStartedAt = msg.serverStartedAt;
+  }
   if (msg.type === "connected" || msg.type === "ui_reload") {
     if (msg.uiVersion) {
       if (state.uiVersion && state.uiVersion !== msg.uiVersion) {
@@ -604,15 +813,10 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// Instant resume when phone wakes up or switches back to the app
+// Instant resume when phone wakes up, changes networks, or switches back to the app
 function ensureLiveConnectionOnWake() {
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-    connectWebSocket();
-  }
-  loadHostStatus();
-  if (state.activeSessionId) {
-    loadSessionDetail(state.activeSessionId, false);
-  }
+  reconnectNow("wake");
+  refreshAfterReconnect();
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -621,7 +825,9 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("online", ensureLiveConnectionOnWake);
+window.addEventListener("offline", () => setConnectionState("offline"));
 window.__onAppResume = ensureLiveConnectionOnWake;
+window.__onNetworkChanged = () => reconnectNow("network");
 
 // --- Data Loading & Instant Client Cache ---
 let prefetchScheduled = false;
@@ -631,8 +837,10 @@ function schedulePrefetchTopSessions() {
   setTimeout(async () => {
     const candidates = state.sessions
       .filter((s) => s.id !== state.activeSessionId && !state.sessionCache.has(s.id))
-      .slice(0, 6);
+      .slice(0, 3);
     for (const s of candidates) {
+      // Prefetch is a nicety; never compete with the active session while reconnecting.
+      if (conn.state !== "online") break;
       try {
         const data = await apiFetch(`/api/sessions/${encodeURIComponent(s.id)}`);
         state.sessionCache.set(s.id, {
@@ -643,7 +851,7 @@ function schedulePrefetchTopSessions() {
         // Ignore background prefetch errors
       }
     }
-  }, 600);
+  }, 1500);
 }
 
 async function loadHostStatus() {
@@ -957,6 +1165,10 @@ function updateHostBanner() {
   if (!dot || !text || !state.hostStatus) return;
 
   const hs = state.hostStatus;
+  if (conn.state !== "online" && conn.state !== "connecting") {
+    dot.className = conn.state === "offline" ? "status-dot" : "status-dot warning";
+    return;
+  }
   if (hs.desktopAppConnected) {
     dot.className = "status-dot online";
     text.textContent = `${hs.hostname} • ${hs.activeSessionsCount} active`;
@@ -3664,23 +3876,21 @@ function startAutoAuthRecoveryLoop() {
         }
       }
       const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
-      const r = await fetch("/api/health", { headers });
+      const r = await fetchWithTimeout("/api/health", { headers }, 8000);
       if (!r.ok) return;
       const d = await r.json();
       if (d.authenticated) {
         clearInterval(authRecoveryTimer);
         authRecoveryTimer = null;
         document.getElementById("qrModal")?.classList.remove("open");
-        connectWebSocket();
-        await Promise.all([loadHostStatus(), loadSessionsList(true)]);
-        if (state.activeSessionId) {
-          loadSessionDetail(state.activeSessionId, true);
-        }
+        conn.needsFullRefresh = true;
+        conn.state = "reconnecting";
+        connectWebSocket(true);
       }
     } catch {
       // Keep polling quietly until network or server recovers
     }
-  }, 2500);
+  }, 8000);
 }
 
 async function openQrModal(isUnauthenticated = false) {
@@ -4075,20 +4285,17 @@ function setupEventListeners() {
   });
 
   // File / Camera attachment input
-  document.getElementById("fileUploadInput")?.addEventListener("change", (e) => {
+  document.getElementById("fileUploadInput")?.addEventListener("change", async (e) => {
     const files = Array.from(e.target.files || []);
-    for (const file of files) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        state.stagedAttachments.push({
-          name: file.name,
-          dataBase64: String(reader.result),
-        });
-        renderStagedAttachments();
-      };
-      reader.readAsDataURL(file);
-    }
     e.target.value = "";
+    for (const file of files) {
+      try {
+        state.stagedAttachments.push(await prepareAttachment(file));
+        renderStagedAttachments();
+      } catch (err) {
+        alert(`Couldn't attach ${file.name}: ${err.message || err}`);
+      }
+    }
   });
 
   // Send Prompt to Desktop Session
@@ -4121,6 +4328,7 @@ function setupEventListeners() {
       await apiFetch(`/api/sessions/${encodeURIComponent(state.activeSessionId)}/message`, {
         method: "POST",
         body: { prompt, deliveryMode, mode, attachments },
+        timeoutMs: attachments.length > 0 ? 180_000 : 30_000,
       });
       scheduleActiveSessionRefresh(300);
     } catch (err) {
@@ -4200,6 +4408,7 @@ function setupEventListeners() {
         comment,
         annotatedImageBase64,
       },
+      timeoutMs: 120_000,
     });
     document.getElementById("imageModal")?.classList.remove("open");
     await loadSessionDetail(state.activeSessionId, false);
@@ -4223,6 +4432,7 @@ function setupEventListeners() {
           },
         ],
       },
+      timeoutMs: 120_000,
     });
     document.getElementById("imageModal")?.classList.remove("open");
     scheduleActiveSessionRefresh(250);
@@ -4313,6 +4523,39 @@ function setupEventListeners() {
   });
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error || new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+// Phone photos are often 5–15 MB; downscale them before upload so sends finish quickly over cellular WAN.
+async function prepareAttachment(file) {
+  const isRasterImage = /^image\/(jpeg|png|webp)$/i.test(file.type || "");
+  if (isRasterImage && file.size > 1.5 * 1024 * 1024 && typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(file);
+      const maxDim = 2560;
+      const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      if (typeof bitmap.close === "function") bitmap.close();
+      return {
+        name: `${file.name.replace(/\.[^.]+$/, "") || "photo"}.jpg`,
+        dataBase64: canvas.toDataURL("image/jpeg", 0.86),
+      };
+    } catch {
+      // Fall back to the original file if this browser cannot decode it
+    }
+  }
+  return { name: file.name, dataBase64: await readFileAsDataUrl(file) };
+}
+
 function renderStagedAttachments() {
   const wrap = document.getElementById("stagedAttachments");
   if (!wrap) return;
@@ -4389,16 +4632,22 @@ async function init() {
   // so unauthenticated new PCs open the MFA / Phone Approval modal once without resetting the input!
   try {
     const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
-    const healthRes = await fetch("/api/health", { headers });
+    const healthRes = await fetchWithTimeout("/api/health", { headers }, 8000);
     if (healthRes.ok) {
       const health = await healthRes.json();
+      conn.serverStartedAt = health.serverStartedAt || null;
       if (!health.authenticated) {
+        setConnectionState("auth");
         await openQrModal(true);
         return;
       }
     }
   } catch {
-    startAutoAuthRecoveryLoop();
+    // Desktop unreachable right now: keep cached UI visible and let the reconnect loop recover.
+    conn.needsFullRefresh = true;
+    setConnectionState("offline");
+    connectWebSocket();
+    return;
   }
 
   connectWebSocket();

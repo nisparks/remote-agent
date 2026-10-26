@@ -13,6 +13,12 @@ internal static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        // Exactly one tray supervisor per user session; a second copy would start competing servers.
+        using var singleInstance = new Mutex(true, @"Local\CopilotRemoteAgentDesktop", out bool isFirstInstance);
+        if (!isFirstInstance)
+        {
+            return;
+        }
         ApplicationConfiguration.Initialize();
         Application.Run(new MainControlForm(args));
     }
@@ -21,11 +27,23 @@ internal static class Program
 public sealed class MainControlForm : Form
 {
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(25) };
+    private readonly HttpClient _healthHttp = new() { Timeout = TimeSpan.FromSeconds(5) };
     private readonly string _repoRoot;
     private readonly int _port = 4321;
     private Process? _serverProcess;
     private readonly System.Windows.Forms.Timer _pollTimer;
+    private readonly System.Windows.Forms.Timer _supervisorTimer;
     private readonly NotifyIcon _trayIcon;
+    private bool _supervising;
+    private int _healthFailures;
+    private DateTime _serverStartedUtc = DateTime.MinValue;
+    private DateTime _nextStartAllowedUtc = DateTime.MinValue;
+    private TimeSpan _restartBackoff = TimeSpan.FromSeconds(2);
+    private bool _legacyServerDetected;
+    private bool _legacyBalloonShowing;
+    private DateTime _lastLegacyNoticeUtc = DateTime.MinValue;
+    private const string LegacyServerStatusText =
+        "⚠ An older Remote Agent server (running as administrator) is blocking the update. Tray menu → \"Finish setup\" to replace it.";
 
     private readonly Label _statusHeaderLabel;
     private readonly Label _desktopBridgeLabel;
@@ -251,7 +269,7 @@ public sealed class MainControlForm : Form
         autoCopilotItem.CheckedChanged += (_, _) => SetAutoLaunchCopilotEnabled(autoCopilotItem.Checked);
         trayMenu.Items.Add(autoCopilotItem);
 
-        trayMenu.Items.Add("Enable Pre-Login Boot Service (UAC)", null, (_, _) => EnablePreLoginBootService());
+        trayMenu.Items.Add("Finish setup: replace old admin server && enable restart sign-in (UAC)...", null, (_, _) => EnableUpdateAutoSignIn());
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add("Quit Copilot Remote Agent", null, (_, _) =>
         {
@@ -267,6 +285,15 @@ public sealed class MainControlForm : Form
             Visible = true
         };
         _trayIcon.DoubleClick += (_, _) => ShowFromTray();
+        _trayIcon.BalloonTipClicked += (_, _) =>
+        {
+            if (_legacyBalloonShowing)
+            {
+                _legacyBalloonShowing = false;
+                EnableUpdateAutoSignIn();
+            }
+        };
+        _trayIcon.BalloonTipClosed += (_, _) => _legacyBalloonShowing = false;
 
         // Ensure auto-start with Windows is registered by default
         if (!IsAutoStartEnabled())
@@ -282,8 +309,18 @@ public sealed class MainControlForm : Form
             ShowInTaskbar = false;
         }
 
-        _pollTimer = new System.Windows.Forms.Timer { Interval = 2500 };
-        _pollTimer.Tick += async (_, _) => await RefreshStatusAsync();
+        // UI refresh is cosmetic; keep it light and only while the window is visible.
+        _pollTimer = new System.Windows.Forms.Timer { Interval = 10_000 };
+        _pollTimer.Tick += async (_, _) =>
+        {
+            if (Visible && WindowState != FormWindowState.Minimized)
+            {
+                await RefreshStatusAsync();
+            }
+        };
+
+        _supervisorTimer = new System.Windows.Forms.Timer { Interval = 5_000 };
+        _supervisorTimer.Tick += async (_, _) => await SuperviseServerAsync();
 
         Load += async (_, _) =>
         {
@@ -296,9 +333,21 @@ public sealed class MainControlForm : Form
                 EnsureGitHubCopilotDesktopRunning();
                 EnsureConfiguredStartupAppsRunning();
             }
-            await EnsureBackendServerRunningAsync();
-            await RefreshStatusAsync();
+            await SuperviseServerAsync();
+            _supervisorTimer.Start();
+            if (!startMinimized)
+            {
+                await RefreshStatusAsync();
+            }
             _pollTimer.Start();
+        };
+
+        VisibleChanged += async (_, _) =>
+        {
+            if (Visible)
+            {
+                await RefreshStatusAsync();
+            }
         };
 
         FormClosing += (_, e) =>
@@ -317,6 +366,7 @@ public sealed class MainControlForm : Form
             }
 
             _pollTimer.Stop();
+            _supervisorTimer.Stop();
             _trayIcon.Visible = false;
             StopBackendServer();
         };
@@ -399,10 +449,103 @@ public sealed class MainControlForm : Form
         return Directory.GetCurrentDirectory();
     }
 
-    private async Task EnsureBackendServerRunningAsync()
+    /// <summary>
+    /// Keeps exactly one healthy bridge server running. A busy server is given ~20s of failed
+    /// health checks before it is restarted, and a port held by another process is never duplicated.
+    /// </summary>
+    private async Task SuperviseServerAsync()
     {
-        if (await IsServerListeningAsync()) return;
+        if (_supervising) return;
+        _supervising = true;
+        try
+        {
+            var health = await ProbeServerHealthAsync();
+            if (health.Healthy)
+            {
+                _healthFailures = 0;
+                bool ownsHealthyServer = _serverProcess is { HasExited: false };
+                _legacyServerDetected = health.Legacy && !ownsHealthyServer;
+                if (_legacyServerDetected)
+                {
+                    NotifyLegacyServerBlocking();
+                }
+                if (_serverStartedUtc != DateTime.MinValue && DateTime.UtcNow - _serverStartedUtc > TimeSpan.FromMinutes(2))
+                {
+                    _restartBackoff = TimeSpan.FromSeconds(2);
+                }
+                return;
+            }
+            _legacyServerDetected = false;
 
+            bool ownsRunningServer = _serverProcess is { HasExited: false };
+            if (ownsRunningServer && DateTime.UtcNow - _serverStartedUtc < TimeSpan.FromSeconds(25))
+            {
+                return; // Still starting up
+            }
+
+            _healthFailures++;
+            if (ownsRunningServer)
+            {
+                if (_healthFailures < 4) return;
+                StopBackendServer();
+            }
+            else if (IsPortListening())
+            {
+                _statusHeaderLabel.Text = $"Port {_port} is held by another process; waiting for it to respond...";
+                return;
+            }
+
+            if (DateTime.UtcNow < _nextStartAllowedUtc) return;
+            await StartBackendServerAsync();
+            _nextStartAllowedUtc = DateTime.UtcNow + _restartBackoff;
+            _restartBackoff = TimeSpan.FromSeconds(Math.Min(60, _restartBackoff.TotalSeconds * 2));
+            _healthFailures = 0;
+        }
+        finally
+        {
+            _supervising = false;
+        }
+    }
+
+    private bool IsPortListening()
+    {
+        try
+        {
+            return System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveTcpListeners()
+                .Any(ep => ep.Port == _port);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string ResolveNodeExecutable()
+    {
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        foreach (string dir in (pathEnv ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                string candidate = Path.Combine(dir.Trim('"'), "node.exe");
+                if (File.Exists(candidate)) return candidate;
+            }
+            catch
+            {
+                // Ignore malformed PATH entries
+            }
+        }
+        string programFilesNode = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "nodejs",
+            "node.exe"
+        );
+        return File.Exists(programFilesNode) ? programFilesNode : "node.exe";
+    }
+
+    private async Task StartBackendServerAsync()
+    {
         try
         {
             if (!Directory.Exists(Path.Combine(_repoRoot, "node_modules")))
@@ -423,22 +566,19 @@ public sealed class MainControlForm : Form
                 }
             }
 
+            // Start node directly (not via cmd/npm) so this supervisor owns and can stop the real server process.
             var psi = new ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = "/c npm start",
+                FileName = ResolveNodeExecutable(),
+                Arguments = "--no-warnings --import tsx src/server.ts",
                 WorkingDirectory = _repoRoot,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
             psi.Environment["PORT"] = _port.ToString();
             _serverProcess = Process.Start(psi);
-
-            for (int i = 0; i < 15; i++)
-            {
-                await Task.Delay(400);
-                if (await IsServerListeningAsync()) break;
-            }
+            _serverStartedUtc = DateTime.UtcNow;
+            _statusHeaderLabel.Text = "Starting local bridge server on port 4321...";
         }
         catch (Exception ex)
         {
@@ -448,15 +588,43 @@ public sealed class MainControlForm : Form
 
     private async Task<bool> IsServerListeningAsync()
     {
+        return (await ProbeServerHealthAsync()).Healthy;
+    }
+
+    /// <summary>
+    /// Servers built before the reliability overhaul do not report serverStartedAt; one of those
+    /// still holding the port (typically launched by the old elevated scheduled task) blocks the update.
+    /// </summary>
+    private async Task<(bool Healthy, bool Legacy)> ProbeServerHealthAsync()
+    {
         try
         {
-            using var res = await _http.GetAsync($"http://127.0.0.1:{_port}/api/health");
-            return res.IsSuccessStatusCode;
+            using var res = await _healthHttp.GetAsync($"http://127.0.0.1:{_port}/api/health");
+            if (!res.IsSuccessStatusCode) return (false, false);
+            string body = await res.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+            bool legacy = doc.RootElement.ValueKind == JsonValueKind.Object &&
+                !doc.RootElement.TryGetProperty("serverStartedAt", out _);
+            return (true, legacy);
         }
         catch
         {
-            return false;
+            return (false, false);
         }
+    }
+
+    private void NotifyLegacyServerBlocking()
+    {
+        _statusHeaderLabel.Text = LegacyServerStatusText;
+        if (DateTime.UtcNow - _lastLegacyNoticeUtc < TimeSpan.FromHours(2)) return;
+        _lastLegacyNoticeUtc = DateTime.UtcNow;
+        _legacyBalloonShowing = true;
+        _trayIcon.ShowBalloonTip(
+            30_000,
+            "Copilot Remote Agent: finish the update",
+            "An older server running as administrator is still answering your phone. Click here and approve the prompt to switch to the updated server.",
+            ToolTipIcon.Warning
+        );
     }
 
     private void StopBackendServer()
@@ -466,12 +634,14 @@ public sealed class MainControlForm : Form
             try
             {
                 _serverProcess.Kill(entireProcessTree: true);
+                _serverProcess.WaitForExit(5000);
             }
             catch
             {
                 // Ignore
             }
         }
+        _serverProcess = null;
     }
 
     private async Task RefreshStatusAsync()
@@ -487,7 +657,9 @@ public sealed class MainControlForm : Form
             int activeSessions = root.GetProperty("activeSessionsCount").GetInt32();
             int totalSessions = root.GetProperty("totalSessionsCount").GetInt32();
 
-            _statusHeaderLabel.Text = $"Host: {hostname} • Local Port: {_port} • Sessions: {activeSessions} running / {totalSessions} total";
+            _statusHeaderLabel.Text = _legacyServerDetected
+                ? LegacyServerStatusText
+                : $"Host: {hostname} • Local Port: {_port} • Sessions: {activeSessions} running / {totalSessions} total";
             _desktopBridgeLabel.Text = appConnected
                 ? "✅ GitHub Copilot Desktop App Bridge: Connected Live (WebSocket + SDK)"
                 : "🟡 GitHub Copilot Desktop App Bridge: Standalone Copilot SDK & Session Watcher Ready";
@@ -562,8 +734,8 @@ public sealed class MainControlForm : Form
         }
         catch
         {
-            // Auto-restart backend server if it stopped
-            await EnsureBackendServerRunningAsync();
+            // The supervisor timer owns restarts; the UI only reports the current state.
+            _statusHeaderLabel.Text = $"Waiting for the local bridge server on port {_port}...";
         }
     }
 
@@ -780,15 +952,15 @@ public sealed class MainControlForm : Form
         }
     }
 
-    private void EnablePreLoginBootService()
+    private void EnableUpdateAutoSignIn()
     {
         try
         {
-            string scriptPath = Path.Combine(_repoRoot, "scripts", "enable-boot-service.ps1");
+            string scriptPath = Path.Combine(_repoRoot, "scripts", "enable-update-auto-signin.ps1");
             var psi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\" -RepoRoot \"{_repoRoot}\"",
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
                 Verb = "runas",
                 UseShellExecute = true
             };

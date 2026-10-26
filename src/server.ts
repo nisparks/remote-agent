@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, type WebSocket as WsClient } from "ws";
 import { AuthManager } from "./auth.js";
 import { DesktopAppBridge } from "./desktop-bridge.js";
+import { describeError, enableFileLogging, getLogFilePath, logEvent } from "./logger.js";
 import { CopilotSdkEngine } from "./sdk-engine.js";
 import { SessionStateStore } from "./session-store.js";
 import { TlsManager } from "./tls.js";
@@ -57,6 +58,9 @@ export class RemoteAgentServer {
   private resolvedRequestIds = new Set<string>();
   private stateWatcher: fs.FSWatcher | null = null;
   private publicWatcher: fs.FSWatcher | null = null;
+  private wsAlive = new WeakMap<WsClient, boolean>();
+  private wsHeartbeatTimer: NodeJS.Timeout | null = null;
+  private readonly startedAt = new Date().toISOString();
   private port: number;
   private host: string;
   private allowLocalhostBypass: boolean;
@@ -69,7 +73,7 @@ export class RemoteAgentServer {
     this.enableWanAutoStart = options.enableWanAutoStart ?? true;
 
     this.auth = new AuthManager(options.customToken);
-    this.store = new SessionStateStore();
+    this.store = new SessionStateStore({ persistEventIndex: !options.customToken });
     this.bridge = new DesktopAppBridge();
     this.sdk = new CopilotSdkEngine();
     this.wan = new WanTunnelManager();
@@ -83,16 +87,22 @@ export class RemoteAgentServer {
 
     const reqHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
       this.handleHttpRequest(req, res).catch((err) => {
+        logEvent("warn", "request failed", { path: (req.url || "").split("?")[0], ...describeError(err) });
         if (!res.headersSent) {
           this.sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
         }
       });
     };
 
+    // Allow slow cellular uploads and keep idle mobile TLS connections warm, while still bounding header stalls.
+    const applyHttpTimeouts = (srv: http.Server) => {
+      srv.requestTimeout = 300_000;
+      srv.headersTimeout = 35_000;
+      srv.keepAliveTimeout = 30_000;
+    };
+
     this.httpServer = http.createServer(reqHandler);
-    this.httpServer.headersTimeout = 10_000;
-    this.httpServer.requestTimeout = 25_000;
-    this.httpServer.keepAliveTimeout = 5_000;
+    applyHttpTimeouts(this.httpServer);
 
     const tlsCreds = TlsManager.ensureCredentials();
     if (tlsCreds) {
@@ -103,14 +113,15 @@ export class RemoteAgentServer {
         },
         reqHandler
       );
-      this.httpsServer.headersTimeout = 10_000;
-      this.httpsServer.requestTimeout = 25_000;
-      this.httpsServer.keepAliveTimeout = 5_000;
+      applyHttpTimeouts(this.httpsServer);
     }
 
     // Single-port HTTP + HTTPS (TLS) multiplexer with 5s first-byte anti-Slowloris timeout:
     // Peeks at the first byte on port 4321: 0x16 (TLS ClientHello) -> httpsServer, else -> httpServer
     this.netServer = net.createServer((socket) => {
+      socket.setNoDelay(true);
+      // TCP keepalive detects dead phone connections and keeps carrier NAT mappings warm.
+      socket.setKeepAlive(true, 30_000);
       const firstByteTimer = setTimeout(() => {
         socket.destroy();
       }, 5_000);
@@ -153,10 +164,7 @@ export class RemoteAgentServer {
   }
 
   async start(): Promise<{ port: number; lanUrls: string[]; tailscaleUrls: string[]; token: string }> {
-    await this.sdk.initialize();
-    this.bridge.start();
-    this.startSessionStateWatcher();
-
+    // Claim the port before starting watchers/bridges so a duplicate instance exits without side effects.
     await new Promise<void>((resolve, reject) => {
       this.netServer.once("error", reject);
       this.netServer.listen(this.port, this.host, () => {
@@ -164,6 +172,16 @@ export class RemoteAgentServer {
         resolve();
       });
     });
+
+    try {
+      await this.sdk.initialize();
+      this.bridge.start();
+      this.startSessionStateWatcher();
+      this.startWebSocketHeartbeat();
+    } catch (err) {
+      await this.stop().catch(() => {});
+      throw err;
+    }
 
     const actualPort = this.getPort();
     this.wan.setLocalPort(actualPort);
@@ -183,6 +201,11 @@ export class RemoteAgentServer {
 
   async stop(): Promise<void> {
     this.wan.stopTunnel();
+    if (this.wsHeartbeatTimer) {
+      clearInterval(this.wsHeartbeatTimer);
+      this.wsHeartbeatTimer = null;
+    }
+    this.store.stopBackgroundWork();
     if (this.stateWatcher) {
       this.stateWatcher.close();
       this.stateWatcher = null;
@@ -219,30 +242,32 @@ export class RemoteAgentServer {
       }
 
       if (!this.auth.isAuthorized(req, this.allowLocalhostBypass)) {
+        logEvent("warn", "websocket unauthorized", { ip: this.auth.getClientIp(req) });
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
       }
 
       this.wss.handleUpgrade(req, socket, head, (ws) => {
+        const clientIp = this.auth.getClientIp(req);
         this.clients.add(ws);
+        this.wsAlive.set(ws, true);
+        logEvent("info", "websocket connected", { ip: clientIp, clients: this.clients.size });
         ws.send(
           JSON.stringify({
             type: "connected",
             timestamp: new Date().toISOString(),
+            serverStartedAt: this.startedAt,
             desktopAppConnected: this.bridge.isConnected(),
             hostname: os.hostname(),
             uiVersion: this.getUiVersion(),
           })
         );
-        const pingTimer = setInterval(() => {
-          if (ws.readyState === 1) {
-            try {
-              ws.ping();
-            } catch {}
-          }
-        }, 20_000);
+        ws.on("pong", () => {
+          this.wsAlive.set(ws, true);
+        });
         ws.on("message", (raw) => {
+          this.wsAlive.set(ws, true);
           try {
             const parsed = JSON.parse(String(raw));
             if (parsed?.type === "ping") {
@@ -250,15 +275,39 @@ export class RemoteAgentServer {
             }
           } catch {}
         });
-        ws.on("close", () => {
-          clearInterval(pingTimer);
+        ws.on("error", () => {
+          // Close handler below performs cleanup
+        });
+        ws.on("close", (code) => {
           this.clients.delete(ws);
+          logEvent("info", "websocket closed", { ip: clientIp, code, clients: this.clients.size });
         });
       });
     };
 
     this.httpServer.on("upgrade", onUpgrade);
     this.httpsServer?.on("upgrade", onUpgrade);
+  }
+
+  private startWebSocketHeartbeat(): void {
+    if (this.wsHeartbeatTimer) return;
+    // Phones that sleep or switch networks leave half-open sockets; reap them instead of buffering broadcasts forever.
+    this.wsHeartbeatTimer = setInterval(() => {
+      for (const ws of this.clients) {
+        if (this.wsAlive.get(ws) === false) {
+          this.clients.delete(ws);
+          try {
+            ws.terminate();
+          } catch {}
+          continue;
+        }
+        this.wsAlive.set(ws, false);
+        try {
+          ws.ping();
+        } catch {}
+      }
+    }, 20_000);
+    this.wsHeartbeatTimer.unref();
   }
 
   private setupBridgeListeners(): void {
@@ -340,8 +389,9 @@ export class RemoteAgentServer {
     const stateDir = path.join(this.store.getCopilotHome(), "session-state");
     if (!fs.existsSync(stateDir)) return;
 
-    let debounceTimer: NodeJS.Timeout | null = null;
-    let lastChangedSessionId: string | null = null;
+    // Per-session throttle: active agents write constantly, so a trailing-only debounce could starve updates.
+    const pendingBroadcasts = new Map<string, NodeJS.Timeout>();
+    const lastBroadcastAt = new Map<string, number>();
 
     try {
       this.stateWatcher = fs.watch(stateDir, { recursive: true }, (_eventType, filename) => {
@@ -357,17 +407,22 @@ export class RemoteAgentServer {
           normalized.endsWith("plan.md") ||
           normalized.includes("/files/")
         ) {
-          lastChangedSessionId = sessionId;
           this.store.invalidateSessionCache(sessionId);
-          if (debounceTimer) clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(() => {
+          if (pendingBroadcasts.has(sessionId)) return;
+          const sinceLast = Date.now() - (lastBroadcastAt.get(sessionId) || 0);
+          const delay = sinceLast >= 1000 ? 150 : 1000 - sinceLast;
+          const timer = setTimeout(() => {
+            pendingBroadcasts.delete(sessionId);
+            lastBroadcastAt.set(sessionId, Date.now());
             this.broadcast({
               type: "session_file_updated",
-              sessionId: lastChangedSessionId,
+              sessionId,
               file: normalized,
               timestamp: new Date().toISOString(),
             });
-          }, 250);
+          }, delay);
+          timer.unref();
+          pendingBroadcasts.set(sessionId, timer);
         }
       });
     } catch {
@@ -562,6 +617,7 @@ export class RemoteAgentServer {
         ok: true,
         authenticated: this.auth.isAuthorized(req, this.allowLocalhostBypass),
         desktopAppConnected: this.bridge.isConnected(),
+        serverStartedAt: this.startedAt,
       });
       return;
     }
@@ -1558,8 +1614,17 @@ export class RemoteAgentServer {
       return;
     }
 
-    // Quick local mobile install & 1-tap auto-pair page (/install and /apk)
+    // Quick local mobile install & 1-tap auto-pair page (/install and /apk). The pre-paired APK embeds the
+    // pairing token, so it is only served to authenticated clients or directly on the private LAN.
+    const isTrustedInstallClient =
+      this.auth.isAuthorized(req, this.allowLocalhostBypass) ||
+      (this.allowLocalhostBypass && this.auth.isPrivateLanOrLocalIp(clientIp));
+
     if (pathname === "/apk") {
+      if (!isTrustedInstallClient) {
+        this.sendJson(res, 401, { error: "Open /apk from your home Wi-Fi or a paired device." });
+        return;
+      }
       const pairedApk = path.join(os.homedir(), ".copilot", "RemoteAgent-paired.apk");
       const fallbackApk = path.join(RELEASES_DIR, "RemoteAgent-android.apk");
       const targetApk =
@@ -1579,11 +1644,7 @@ export class RemoteAgentServer {
       return;
     }
 
-    if (
-      pathname === "/install" &&
-      (this.auth.isAuthorized(req, this.allowLocalhostBypass) ||
-        (this.allowLocalhostBypass && this.auth.isPrivateLanOrLocalIp(clientIp)))
-    ) {
+    if (pathname === "/install" && isTrustedInstallClient) {
       const actualPort = this.getPort();
       const { lanUrls, tailscaleUrls } = AuthManager.getNetworkUrls(actualPort);
       const wanStatus = this.wan.getStatus(tailscaleUrls);
@@ -1607,9 +1668,7 @@ export class RemoteAgentServer {
 
     // Serve downloadable Android APK & Windows Desktop Installer under /download/*
     if (pathname.startsWith("/download/")) {
-      const isLanAllowed =
-        this.allowLocalhostBypass && this.auth.isPrivateLanOrLocalIp(clientIp);
-      if (!this.auth.isAuthorized(req, this.allowLocalhostBypass) && !isLanAllowed) {
+      if (!isTrustedInstallClient) {
         this.sendJson(res, 401, { error: "Unauthorized download request" });
         return;
       }
@@ -1708,10 +1767,47 @@ const isMain =
   path.resolve(process.argv[1]).toLowerCase() === path.resolve(__filename).toLowerCase();
 
 if (isMain) {
+  enableFileLogging();
+  process.on("uncaughtException", (err) => {
+    logEvent("error", "uncaught exception; exiting so the supervisor restarts cleanly", describeError(err));
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    logEvent("warn", "unhandled promise rejection", describeError(reason));
+  });
+
   const server = new RemoteAgentServer();
   server
     .start()
     .then(async (info) => {
+      logEvent("info", "server started", { pid: process.pid, port: info.port, log: getLogFilePath() });
+
+      // Record event-loop stalls and memory so intermittent disconnects can be diagnosed afterwards.
+      let lastTick = Date.now();
+      setInterval(() => {
+        const now = Date.now();
+        const lag = now - lastTick - 1000;
+        lastTick = now;
+        if (lag > 1500) logEvent("warn", "event loop stalled", { lagMs: lag });
+      }, 1000).unref();
+      setInterval(() => {
+        const mem = process.memoryUsage();
+        logEvent("info", "health", {
+          rssMB: Math.round(mem.rss / 1048576),
+          heapMB: Math.round(mem.heapUsed / 1048576),
+        });
+      }, 10 * 60_000).unref();
+
+      const shutdown = (signal: string) => {
+        logEvent("info", "server stopping", { signal });
+        server
+          .stop()
+          .catch(() => {})
+          .finally(() => process.exit(0));
+      };
+      process.once("SIGINT", () => shutdown("SIGINT"));
+      process.once("SIGTERM", () => shutdown("SIGTERM"));
+
       const primaryUrl = info.lanUrls[0] || info.tailscaleUrls[0] || `http://localhost:${info.port}`;
       const pairUrl = `${primaryUrl}/?token=${encodeURIComponent(info.token)}`;
       console.log("\n==============================================================");
@@ -1735,7 +1831,13 @@ if (isMain) {
       }
       console.log("==============================================================\n");
     })
-    .catch((err) => {
+    .catch((err: NodeJS.ErrnoException) => {
+      if (err?.code === "EADDRINUSE") {
+        // Another healthy instance already owns the port; exit quietly instead of becoming a duplicate.
+        logEvent("warn", "port already in use; another Remote Agent instance is running", { pid: process.pid });
+        process.exit(3);
+      }
+      logEvent("error", "failed to start server", describeError(err));
       console.error("Failed to start Remote Agent server:", err);
       process.exit(1);
     });
