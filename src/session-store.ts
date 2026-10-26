@@ -214,6 +214,9 @@ export class SessionStateStore {
     });
   }
 
+  /** Called when coalescing served detail data older than the latest event log; retry after retryInMs. */
+  onStaleDetailServed: ((sessionId: string, retryInMs: number) => void) | null = null;
+
   stopBackgroundWork(): void {
     this.indexer.stop();
   }
@@ -303,7 +306,10 @@ export class SessionStateStore {
         break;
       }
       // The line crossing regionStart is read in full as the last line of the next older region.
-      regionEnd = region.firstLineStart >= 0 ? region.firstLineStart : regionStart;
+      // When no complete line starts inside this region, that line is longer than the region (and
+      // DETAIL_MAX_LINE_BYTES), so skip past it instead of rereading the same region.
+      regionEnd =
+        region.firstLineStart >= 0 && region.firstLineStart < regionEnd ? region.firstLineStart : regionStart;
     }
 
     const lines: string[] = [];
@@ -1356,8 +1362,13 @@ export class SessionStateStore {
         existingCache.eventsSize === eventsSize &&
         existingCache.eventsMtimeMs === eventsMtimeMs &&
         existingCache.indexStamp === indexStamp;
-      // Coalesce bursts of refreshes while an agent is writing events continuously.
-      if ((unchanged && age < 180_000) || age < DETAIL_REPARSE_MIN_INTERVAL_MS) {
+      if (unchanged && age < 180_000) {
+        return existingCache.data;
+      }
+      // Coalesce bursts of refreshes while an agent is writing events continuously, and request a
+      // trailing refresh so the newest events still reach clients after the burst ends.
+      if (age < DETAIL_REPARSE_MIN_INTERVAL_MS) {
+        this.onStaleDetailServed?.(sessionId, DETAIL_REPARSE_MIN_INTERVAL_MS - age + 50);
         return existingCache.data;
       }
     }

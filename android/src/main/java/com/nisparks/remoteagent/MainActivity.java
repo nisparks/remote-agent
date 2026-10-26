@@ -44,6 +44,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
@@ -76,6 +77,8 @@ public class MainActivity extends Activity {
     private int retryAttempt = 0;
     private Runnable pendingRetry = null;
     private long lastSwitchCheckMs = 0;
+    // Background probes can finish after onDestroy; their UI work must then be skipped.
+    private volatile boolean destroyed = false;
 
     private static final class ProbeResult {
         final String base;
@@ -135,6 +138,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
         unregisterNetworkCallback();
         handler.removeCallbacksAndMessages(null);
         probeExecutor.shutdownNow();
@@ -143,6 +147,27 @@ public class MainActivity extends Activity {
             webView = null;
         }
         super.onDestroy();
+    }
+
+    /** Runs work on the main thread unless the activity was destroyed in the meantime. */
+    private void postUi(final Runnable work) {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (destroyed || webView == null) return;
+                work.run();
+            }
+        });
+    }
+
+    private boolean runInBackground(Runnable work) {
+        if (destroyed) return false;
+        try {
+            probeExecutor.execute(work);
+            return true;
+        } catch (RejectedExecutionException e) {
+            return false;
+        }
     }
 
     private void initDefaultsIfEmpty() {
@@ -347,7 +372,7 @@ public class MainActivity extends Activity {
     }
 
     private void connectBest(boolean showSpinnerIfIdle) {
-        if (connectInFlight) return;
+        if (destroyed || connectInFlight) return;
         cancelPendingRetry();
         final List<String> candidates = candidateEndpoints();
         if (candidates.isEmpty()) {
@@ -358,11 +383,11 @@ public class MainActivity extends Activity {
         if (currentBase == null && showSpinnerIfIdle) {
             showStatusPage("Connecting to your desktop…", "", 0);
         }
-        probeExecutor.execute(new Runnable() {
+        boolean started = runInBackground(new Runnable() {
             @Override
             public void run() {
                 final List<ProbeResult> results = probeInPreferenceOrder(candidates);
-                handler.post(new Runnable() {
+                postUi(new Runnable() {
                     @Override
                     public void run() {
                         connectInFlight = false;
@@ -381,17 +406,22 @@ public class MainActivity extends Activity {
                 });
             }
         });
+        if (!started) connectInFlight = false;
     }
 
     private List<ProbeResult> probeInPreferenceOrder(List<String> candidates) {
         List<Future<ProbeResult>> futures = new ArrayList<>();
         for (final String base : candidates) {
-            futures.add(probeExecutor.submit(new Callable<ProbeResult>() {
-                @Override
-                public ProbeResult call() {
-                    return probe(base);
-                }
-            }));
+            try {
+                futures.add(probeExecutor.submit(new Callable<ProbeResult>() {
+                    @Override
+                    public ProbeResult call() {
+                        return probe(base);
+                    }
+                }));
+            } catch (RejectedExecutionException e) {
+                return new ArrayList<>(); // Activity is shutting down
+            }
         }
         List<ProbeResult> results = new ArrayList<>();
         long deadline = SystemClock.elapsedRealtime() + PREFERRED_ENDPOINT_WAIT_MS + PROBE_TIMEOUT_MS;
@@ -460,6 +490,7 @@ public class MainActivity extends Activity {
     }
 
     private void scheduleRetry(long delayMs) {
+        if (destroyed) return;
         cancelPendingRetry();
         retryAttempt++;
         pendingRetry = new Runnable() {
@@ -489,16 +520,16 @@ public class MainActivity extends Activity {
     /** Called when the loaded web app reports it has been offline for a while. */
     private void maybeSwitchEndpoint() {
         long now = SystemClock.elapsedRealtime();
-        if (connectInFlight || currentBase == null || now - lastSwitchCheckMs < 15000) return;
+        if (destroyed || connectInFlight || currentBase == null || now - lastSwitchCheckMs < 15000) return;
         lastSwitchCheckMs = now;
         final String current = currentBase;
         final List<String> candidates = candidateEndpoints();
-        probeExecutor.execute(new Runnable() {
+        runInBackground(new Runnable() {
             @Override
             public void run() {
                 if (probe(current).ok) return; // Same endpoint is fine; the page reconnects itself.
                 final List<ProbeResult> results = probeInPreferenceOrder(candidates);
-                handler.post(new Runnable() {
+                postUi(new Runnable() {
                     @Override
                     public void run() {
                         for (ProbeResult r : results) {
@@ -514,6 +545,7 @@ public class MainActivity extends Activity {
     }
 
     private void loadBase(String base) {
+        if (webView == null) return;
         cancelPendingRetry();
         currentBase = base;
         localPageKind = null;
@@ -526,6 +558,7 @@ public class MainActivity extends Activity {
     }
 
     private void loadBaseWithExplicitToken(String rawBase, String token) {
+        if (webView == null) return;
         String base = normalizeEndpointUrl(rawBase);
         if (base.isEmpty()) {
             showConnectionManagerHtml();
@@ -577,7 +610,7 @@ public class MainActivity extends Activity {
             networkCallback = new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(Network network) {
-                    handler.post(new Runnable() {
+                    postUi(new Runnable() {
                         @Override
                         public void run() {
                             onNetworkChanged();
@@ -587,7 +620,7 @@ public class MainActivity extends Activity {
 
                 @Override
                 public void onLost(Network network) {
-                    handler.post(new Runnable() {
+                    postUi(new Runnable() {
                         @Override
                         public void run() {
                             if (webView != null && currentBase != null) {
@@ -637,6 +670,7 @@ public class MainActivity extends Activity {
     // --- Native pages -------------------------------------------------------------------
 
     private void showStatusPage(String title, String detail, long retryInMs) {
+        if (webView == null) return;
         localPageKind = "status";
         String retryScript = retryInMs > 0
                 ? "var left=" + (retryInMs / 1000) + ";var el=document.getElementById('cd');"
@@ -667,6 +701,7 @@ public class MainActivity extends Activity {
     }
 
     private void showConnectionManagerHtml() {
+        if (webView == null) return;
         cancelPendingRetry();
         currentBase = null;
         localPageKind = "settings";
@@ -835,7 +870,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void reportConnectionState(final String state) {
             if (!trusted()) return;
-            handler.post(new Runnable() {
+            postUi(new Runnable() {
                 @Override
                 public void run() {
                     if ("offline".equals(state)) {
@@ -848,7 +883,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void retryNow() {
             if (!trusted()) return;
-            handler.post(new Runnable() {
+            postUi(new Runnable() {
                 @Override
                 public void run() {
                     retryAttempt = 0;
@@ -877,7 +912,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void connectTo(final String url, final String token) {
             if (!trusted()) return;
-            handler.post(new Runnable() {
+            postUi(new Runnable() {
                 @Override
                 public void run() {
                     loadBaseWithExplicitToken(url, token);
@@ -893,7 +928,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void openConnectionSettings() {
             if (!trusted()) return;
-            handler.post(new Runnable() {
+            postUi(new Runnable() {
                 @Override
                 public void run() {
                     showConnectionManagerHtml();

@@ -6,6 +6,7 @@ import type { IncomingMessage } from "node:http";
 import { describe, it } from "node:test";
 import { AuthManager } from "../src/auth.js";
 import { EventLogIndexer, JsonlLineScanner } from "../src/event-log.js";
+import { SessionStateStore } from "../src/session-store.js";
 
 function fakeRequest(remoteAddress: string, headers: Record<string, string> = {}): IncomingMessage {
   return { socket: { remoteAddress }, headers } as unknown as IncomingMessage;
@@ -91,6 +92,43 @@ describe("connection reliability and auth hardening", () => {
     }
     for (const ip of ["100.12.1.1", "100.128.0.1", "172.32.0.1", "8.8.8.8"]) {
       assert.equal(auth.isPrivateLanOrLocalIp(ip), false, ip);
+    }
+  });
+
+  it("loads history older than a single event-log line larger than a read region", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remote-agent-tail-"));
+    const file = path.join(dir, "events.jsonl");
+    const store = new SessionStateStore({ persistEventIndex: false });
+    try {
+      const fd = fs.openSync(file, "w");
+      for (let i = 0; i < 50; i++) {
+        fs.writeSync(fd, `${JSON.stringify({ type: "user.message", data: { content: `old ${i}` } })}\n`);
+      }
+      // A 40 MB snapshot line spans more than one 32 MB tail region.
+      fs.writeSync(fd, '{"type":"model.messages_snapshot","data":{"blob":"');
+      const chunk = Buffer.alloc(4 * 1024 * 1024, 0x41);
+      for (let i = 0; i < 10; i++) fs.writeSync(fd, chunk);
+      fs.writeSync(fd, '"}}\n');
+      for (let i = 0; i < 5; i++) {
+        fs.writeSync(fd, `${JSON.stringify({ type: "assistant.message", data: { content: `new ${i}` } })}\n`);
+      }
+      fs.closeSync(fd);
+
+      const readFd = fs.openSync(file, "r");
+      try {
+        const reader = store as unknown as {
+          readTailWindow(fd: number, size: number, fileId: string): { lines: string[] };
+        };
+        const win = reader.readTailWindow(readFd, fs.fstatSync(readFd).size, "test");
+        assert.equal(win.lines.length, 55);
+        assert.match(win.lines[0], /old 0/);
+        assert.match(win.lines[54], /new 4/);
+      } finally {
+        fs.closeSync(readFd);
+      }
+    } finally {
+      store.stopBackgroundWork();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

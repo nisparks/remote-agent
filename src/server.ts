@@ -60,6 +60,8 @@ export class RemoteAgentServer {
   private publicWatcher: fs.FSWatcher | null = null;
   private wsAlive = new WeakMap<WsClient, boolean>();
   private wsHeartbeatTimer: NodeJS.Timeout | null = null;
+  private pendingFileBroadcasts = new Map<string, NodeJS.Timeout>();
+  private lastFileBroadcastAt = new Map<string, number>();
   private readonly startedAt = new Date().toISOString();
   private port: number;
   private host: string;
@@ -74,6 +76,8 @@ export class RemoteAgentServer {
 
     this.auth = new AuthManager(options.customToken);
     this.store = new SessionStateStore({ persistEventIndex: !options.customToken });
+    this.store.onStaleDetailServed = (sessionId, retryInMs) =>
+      this.scheduleSessionFileUpdate(sessionId, "events.jsonl", retryInMs);
     this.bridge = new DesktopAppBridge();
     this.sdk = new CopilotSdkEngine();
     this.wan = new WanTunnelManager();
@@ -389,10 +393,6 @@ export class RemoteAgentServer {
     const stateDir = path.join(this.store.getCopilotHome(), "session-state");
     if (!fs.existsSync(stateDir)) return;
 
-    // Per-session throttle: active agents write constantly, so a trailing-only debounce could starve updates.
-    const pendingBroadcasts = new Map<string, NodeJS.Timeout>();
-    const lastBroadcastAt = new Map<string, number>();
-
     try {
       this.stateWatcher = fs.watch(stateDir, { recursive: true }, (_eventType, filename) => {
         if (!filename) return;
@@ -408,26 +408,32 @@ export class RemoteAgentServer {
           normalized.includes("/files/")
         ) {
           this.store.invalidateSessionCache(sessionId);
-          if (pendingBroadcasts.has(sessionId)) return;
-          const sinceLast = Date.now() - (lastBroadcastAt.get(sessionId) || 0);
-          const delay = sinceLast >= 1000 ? 150 : 1000 - sinceLast;
-          const timer = setTimeout(() => {
-            pendingBroadcasts.delete(sessionId);
-            lastBroadcastAt.set(sessionId, Date.now());
-            this.broadcast({
-              type: "session_file_updated",
-              sessionId,
-              file: normalized,
-              timestamp: new Date().toISOString(),
-            });
-          }, delay);
-          timer.unref();
-          pendingBroadcasts.set(sessionId, timer);
+          this.scheduleSessionFileUpdate(sessionId, normalized);
         }
       });
     } catch {
       // Ignore if recursive watch unsupported
     }
+  }
+
+  // Per-session throttle (at most ~1/s): active agents write constantly, so a trailing-only debounce
+  // could starve updates.
+  private scheduleSessionFileUpdate(sessionId: string, file: string, minDelayMs = 150): void {
+    if (this.pendingFileBroadcasts.has(sessionId)) return;
+    const sinceLast = Date.now() - (this.lastFileBroadcastAt.get(sessionId) || 0);
+    const delay = Math.max(minDelayMs, sinceLast >= 1000 ? 0 : 1000 - sinceLast);
+    const timer = setTimeout(() => {
+      this.pendingFileBroadcasts.delete(sessionId);
+      this.lastFileBroadcastAt.set(sessionId, Date.now());
+      this.broadcast({
+        type: "session_file_updated",
+        sessionId,
+        file,
+        timestamp: new Date().toISOString(),
+      });
+    }, delay);
+    timer.unref();
+    this.pendingFileBroadcasts.set(sessionId, timer);
   }
 
   private broadcast(payload: Record<string, unknown>): void {

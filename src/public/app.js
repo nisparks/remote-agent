@@ -512,10 +512,11 @@ function sendHeartbeat(timeoutMs = 10_000) {
   }
   if (conn.pongTimer) clearTimeout(conn.pongTimer);
   conn.pongTimer = setTimeout(() => {
-    if (state.ws === ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.close(4000, "Heartbeat timeout");
-      } catch {}
+    conn.pongTimer = null;
+    if (state.ws === ws) {
+      // A dead link may never finish the close handshake (Chromium waits up to 60s for it), so
+      // abandon this socket and open a fresh one right away instead of waiting for onclose.
+      connectWebSocket(true);
     }
   }, timeoutMs);
 }
@@ -603,6 +604,8 @@ function connectWebSocket(force = false) {
 
   ws.onmessage = (ev) => {
     if (state.ws !== ws) return;
+    // Any traffic on the current socket proves the link works (e.g. after a brief offline blip).
+    if (conn.state !== "online") setConnectionState("online");
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === "pong") {
@@ -627,6 +630,8 @@ function connectWebSocket(force = false) {
     if (conn.attempt >= 2) {
       // Repeated failures: distinguish an expired pairing from a network/server outage.
       const probe = await probeServerAfterDisconnect();
+      // A newer attempt (Retry, network change, wake) may have started while probing; it owns the state.
+      if (state.ws || conn.reconnectTimer) return;
       if (probe === "auth") {
         setConnectionState("auth");
         openQrModal(true);
