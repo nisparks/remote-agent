@@ -168,6 +168,24 @@ describe("RemoteAgentServer & Desktop Copilot Bridge", () => {
     assert.equal(tlsStatus, 200);
   });
 
+  it("keeps answering malformed and oversized requests with 400/431 despite the clientError listener", async () => {
+    const net = await import("node:net");
+    const port = server.getPort();
+    const rawExchange = (payload: string) =>
+      new Promise<string>((resolve, reject) => {
+        const sock = net.connect(port, "127.0.0.1", () => sock.write(payload));
+        let data = "";
+        sock.on("data", (d) => (data += d.toString("latin1")));
+        sock.on("end", () => resolve(data));
+        sock.on("error", (err) => (data ? resolve(data) : reject(err)));
+        sock.setTimeout(5000, () => sock.destroy(new Error("timed out")));
+      });
+    const malformed = await rawExchange("BOGUS\r\n\r\n");
+    assert.match(malformed, /^HTTP\/1\.1 400 /);
+    const oversized = await rawExchange(`GET /api/health HTTP/1.1\r\nHost: x\r\nX-Big: ${"a".repeat(20_000)}\r\n\r\n`);
+    assert.match(oversized, /^HTTP\/1\.1 431 /);
+  });
+
   it("lists real desktop sessions and parses turns, todos, and artifacts", async () => {
     const res = await fetch(`${baseUrl}/api/sessions?token=${testToken}`);
     assert.equal(res.status, 200);

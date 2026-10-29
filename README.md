@@ -149,7 +149,9 @@ If you run GitHub Copilot across multiple machines (for example, a primary Windo
    - If an older server started with administrator rights is still holding port 4321, the tray app shows a notification; click it and approve the prompt to switch to the updated server.
 4. **Diagnosing disconnects**:
    - The server logs startups, crashes, event-loop stalls, and WebSocket connects/disconnects (never tokens) to `~\.copilot\logs\remote-agent-server.log` (rotated at 5 MB).
+   - Requests from internet (non-LAN) clients go to `~\.copilot\remote-agent-access.log` (paths only, never tokens), along with connection-level failures that never reach HTTP: TLS handshake errors, secure connections closed without a request, and connections that send nothing. Use it to tell "the phone never reached the desktop" apart from "it connected but something failed".
    - The phone/web app shows a banner while reconnecting and retries with backoff; the Android app prefers the remote HTTPS URL (which also works at home via your router's hairpin NAT) so it does not reload when you move between Wi-Fi and cellular.
+   - Some networks (often business or guest Wi-Fi) reset or stall the browser engine's TLS connections while letting other apps through. When the Android app can reach an endpoint but the page fails to load directly (or shows nothing for 15 seconds), it reloads through a built-in loopback relay (`http://127.0.0.1:47321`) that carries the page over the app's own certificate- and hostname-verified TLS connection. If a relayed load fails, the next attempt goes direct again.
 
 ---
 

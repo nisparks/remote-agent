@@ -153,6 +153,7 @@ const mainJava = path.join(
   "remoteagent",
   "MainActivity.java"
 );
+const relayJava = path.join(path.dirname(mainJava), "TlsRelay.java");
 
 execFileSync("javac", [
   "-encoding",
@@ -169,6 +170,7 @@ execFileSync("javac", [
   path.join(BUILD_DIR, "classes"),
   rJava,
   mainJava,
+  relayJava,
 ], { stdio: "inherit" });
 
 // 5. d8 dex compilation

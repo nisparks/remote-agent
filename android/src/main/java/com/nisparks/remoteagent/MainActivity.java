@@ -46,6 +46,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 
+import javax.net.ssl.HttpsURLConnection;
+
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "RemoteAgentPrefs";
     private static final String KEY_LAN_URL = "lan_url";
@@ -63,6 +65,10 @@ public class MainActivity extends Activity {
     private static final long PREFERRED_ENDPOINT_WAIT_MS = 3500;
     private static final long[] RETRY_DELAYS_MS = {2000, 4000, 8000, 15000, 30000};
     private static final String LOCAL_PAGE_BASE = "http://localhost/";
+    // Fixed loopback port for the TLS relay, so the relayed page keeps a single origin (and its storage).
+    private static final int RELAY_PORT = 47321;
+    // A direct remote page load that shows nothing for this long is retried through the relay.
+    private static final long DIRECT_LOAD_TIMEOUT_MS = 15000;
 
     private FrameLayout root;
     private WebView webView;
@@ -82,6 +88,14 @@ public class MainActivity extends Activity {
     private long lastSwitchCheckMs = 0;
     // Background probes can finish after onDestroy; their UI work must then be skipped.
     private volatile boolean destroyed = false;
+    // Some networks pass the app's own TLS connections (used by probes) but break the WebView's. After a
+    // direct page load fails on an endpoint the probe reached, the page is loaded through this relay.
+    private volatile TlsRelay relay = null;
+    private boolean preferRelay = false;
+    private boolean currentPageRelayed = false;
+    // Origin the current web app page was requested from (the relay or the endpoint itself).
+    private String currentPageBase = null;
+    private Runnable directLoadWatchdog = null;
 
     private static final class ProbeResult {
         final String base;
@@ -145,6 +159,7 @@ public class MainActivity extends Activity {
         unregisterNetworkCallback();
         handler.removeCallbacksAndMessages(null);
         probeExecutor.shutdownNow();
+        closeRelay();
         if (webView != null) {
             webView.destroy();
             webView = null;
@@ -255,6 +270,14 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageCommitVisible(WebView view, String url) {
+                super.onPageCommitVisible(view, url);
+                if (url != null && !url.startsWith(LOCAL_PAGE_BASE)) {
+                    cancelDirectLoadWatchdog();
+                }
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
                 if (uri == null) return false;
@@ -276,6 +299,8 @@ public class MainActivity extends Activity {
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 if (request == null || !request.isForMainFrame()) return;
                 if (request.getUrl() != null && request.getUrl().toString().startsWith(LOCAL_PAGE_BASE)) return;
+                // Errors from a navigation that was already abandoned (e.g. ERR_ABORTED) are not new failures.
+                if (currentBase == null || !isCurrentPageUrl(request.getUrl())) return;
                 String reason = error != null && error.getDescription() != null
                         ? error.getDescription().toString()
                         : "Network error";
@@ -285,7 +310,12 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
                 if (request == null || !request.isForMainFrame() || response == null) return;
-                if (response.getStatusCode() >= 500) {
+                if (currentBase == null || !isCurrentPageUrl(request.getUrl())) return;
+                if (response.getStatusCode() == 502 && currentPageRelayed) {
+                    TlsRelay r = relay;
+                    String detail = r != null && !r.lastError().isEmpty() ? r.lastError() : "connection failed";
+                    onEndpointFailed("The app's secure connection couldn't reach your desktop: " + detail);
+                } else if (response.getStatusCode() >= 500) {
                     onEndpointFailed("Desktop server error (HTTP " + response.getStatusCode() + ")");
                 }
             }
@@ -293,6 +323,8 @@ public class MainActivity extends Activity {
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler sslHandler, SslError error) {
                 sslHandler.cancel();
+                String sslUrl = error != null ? error.getUrl() : null;
+                if (currentBase == null || (sslUrl != null && !isCurrentPageUrl(Uri.parse(sslUrl)))) return;
                 onEndpointFailed("The remote URL's HTTPS certificate is invalid or expired");
             }
 
@@ -354,6 +386,11 @@ public class MainActivity extends Activity {
     }
 
     private void openExternally(String url) {
+        // Relay URLs only work inside this app; hand other apps the real endpoint address instead.
+        TlsRelay r = relay;
+        if (url != null && currentPageRelayed && currentBase != null && r != null && url.startsWith(r.localBase() + "/")) {
+            url = currentBase + url.substring(r.localBase().length());
+        }
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
         } catch (Exception e) {
@@ -631,7 +668,24 @@ public class MainActivity extends Activity {
     }
 
     private void onEndpointFailed(String reason) {
+        cancelDirectLoadWatchdog();
+        final String failedBase = currentBase;
+        final boolean wasRelayed = currentPageRelayed;
         currentBase = null;
+        if (failedBase != null && failedBase.startsWith("https://") && !wasRelayed) {
+            // The probe reached this endpoint with the app's own TLS stack, but the WebView's connection
+            // failed; some networks break only browser-engine traffic, so retry through the relay now.
+            preferRelay = true;
+            retryAttempt = 0;
+            showStatusPage("Reconnecting…",
+                    "The page didn't load directly (" + reason + "). Retrying over the app's own secure connection.", 0);
+            connectBest(false);
+            return;
+        }
+        if (wasRelayed) {
+            // Alternate modes so a network where only the WebView's direct connection works is never stuck.
+            preferRelay = false;
+        }
         long delay = nextRetryDelay();
         showStatusPage("Can't reach your desktop", reason, delay);
         scheduleRetry(delay);
@@ -670,11 +724,7 @@ public class MainActivity extends Activity {
         currentBase = base;
         localPageKind = null;
         prefs.edit().putString(KEY_LAST_GOOD_URL, base).apply();
-        String token = prefs.getString(KEY_TOKEN, "");
-        String url = (token != null && !token.isEmpty())
-                ? base + "/?token=" + Uri.encode(token)
-                : base + "/";
-        webView.loadUrl(url);
+        navigateTo(base, prefs.getString(KEY_TOKEN, ""));
     }
 
     private void loadBaseWithExplicitToken(String rawBase, String token) {
@@ -687,10 +737,120 @@ public class MainActivity extends Activity {
         cancelPendingRetry();
         currentBase = base;
         localPageKind = null;
+        navigateTo(base, token);
+    }
+
+    /** Loads the web app for an endpoint, through the relay when this network needs it. */
+    private void navigateTo(final String base, final String token) {
+        if (preferRelay && base.startsWith("https://")) {
+            boolean started = runInBackground(new Runnable() {
+                @Override
+                public void run() {
+                    final String relayBase = ensureRelay(base);
+                    postUi(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!base.equals(currentBase)) {
+                                // Superseded by a newer navigation.
+                                if (!currentPageRelayed) closeRelay();
+                                return;
+                            }
+                            if (relayBase != null) {
+                                loadPage(relayBase, token, true);
+                            } else {
+                                loadPage(base, token, false);
+                            }
+                        }
+                    });
+                }
+            });
+            if (started) return;
+        }
+        loadPage(base, token, false);
+    }
+
+    private void loadPage(String pageBase, String token, boolean relayed) {
+        if (webView == null) return;
+        currentPageRelayed = relayed;
+        currentPageBase = pageBase;
+        if (!relayed) {
+            closeRelay();
+        }
+        cancelDirectLoadWatchdog();
+        if (!relayed && pageBase.startsWith("https://")) {
+            armDirectLoadWatchdog(pageBase);
+        }
         String url = (token != null && !token.isEmpty())
-                ? base + "/?token=" + Uri.encode(token)
-                : base + "/";
+                ? pageBase + "/?token=" + Uri.encode(token)
+                : pageBase + "/";
         webView.loadUrl(url);
+    }
+
+    /** Starts (or reuses) the loopback relay for an https endpoint; returns its base URL, or null on failure. */
+    private synchronized String ensureRelay(String base) {
+        Uri uri = Uri.parse(base);
+        String host = uri.getHost();
+        if (host == null || host.isEmpty()) return null;
+        int port = uri.getPort() > 0 ? uri.getPort() : 443;
+        TlsRelay existing = relay;
+        if (existing != null && existing.forwardsTo(host, port)) return existing.localBase();
+        if (existing != null) existing.close();
+        try {
+            relay = TlsRelay.start(host, port, RELAY_PORT, HttpsURLConnection.getDefaultHostnameVerifier());
+            return relay.localBase();
+        } catch (Exception e) {
+            relay = null;
+            return null;
+        }
+    }
+
+    private boolean isCurrentPageUrl(Uri uri) {
+        if (uri == null || currentPageBase == null) return false;
+        Uri base = Uri.parse(currentPageBase);
+        if (uri.getScheme() == null || base.getScheme() == null || uri.getHost() == null || base.getHost() == null) {
+            return false;
+        }
+        return uri.getScheme().equalsIgnoreCase(base.getScheme())
+                && uri.getHost().equalsIgnoreCase(base.getHost())
+                && effectivePort(uri) == effectivePort(base);
+    }
+
+    private static int effectivePort(Uri uri) {
+        if (uri.getPort() > 0) return uri.getPort();
+        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+
+    private synchronized void closeRelay() {
+        final TlsRelay r = relay;
+        if (r == null) return;
+        relay = null;
+        // Closing sends TLS close alerts, which is network I/O and must stay off the main thread.
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                r.close();
+            }
+        }).start();
+    }
+
+    private void armDirectLoadWatchdog(final String pageBase) {
+        directLoadWatchdog = new Runnable() {
+            @Override
+            public void run() {
+                directLoadWatchdog = null;
+                if (destroyed || webView == null || currentBase == null || currentPageRelayed) return;
+                if (!pageBase.equals(currentBase)) return;
+                onEndpointFailed("no response within " + (DIRECT_LOAD_TIMEOUT_MS / 1000) + "s");
+            }
+        };
+        handler.postDelayed(directLoadWatchdog, DIRECT_LOAD_TIMEOUT_MS);
+    }
+
+    private void cancelDirectLoadWatchdog() {
+        if (directLoadWatchdog != null) {
+            handler.removeCallbacks(directLoadWatchdog);
+            directLoadWatchdog = null;
+        }
     }
 
     private String normalizeEndpointUrl(String raw) {
@@ -714,6 +874,11 @@ public class MainActivity extends Activity {
         if (url == null) return false;
         String lowerUrl = url.toLowerCase(java.util.Locale.ROOT);
         if (lowerUrl.startsWith(LOCAL_PAGE_BASE)) return true;
+        TlsRelay r = relay;
+        if (r != null && r.isOpen()) {
+            String relayBase = r.localBase();
+            if (lowerUrl.equals(relayBase) || lowerUrl.startsWith(relayBase + "/")) return true;
+        }
         for (String base : candidateEndpoints()) {
             String lowerBase = base.toLowerCase(java.util.Locale.ROOT);
             if (lowerUrl.equals(lowerBase) || lowerUrl.startsWith(lowerBase + "/")) return true;

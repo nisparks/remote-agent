@@ -5,6 +5,7 @@ import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { TLSSocket } from "node:tls";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import { WebSocketServer, type WebSocket as WsClient } from "ws";
@@ -26,6 +27,9 @@ const PUBLIC_DIR = fs.existsSync(path.join(__dirname, "public"))
   ? path.join(__dirname, "public")
   : path.join(PROJECT_ROOT, "src", "public");
 const RELEASES_DIR = path.join(PROJECT_ROOT, "releases");
+// Set on a client socket once it carries an HTTP request or WebSocket upgrade.
+const REQUEST_SEEN = Symbol("remoteAgent.requestSeen");
+type MarkedSocket = net.Socket & { [REQUEST_SEEN]?: boolean; _parent?: net.Socket };
 
 export interface RemoteAgentServerOptions {
   port?: number;
@@ -100,6 +104,7 @@ export class RemoteAgentServer {
     });
 
     const reqHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
+      (req.socket as MarkedSocket)[REQUEST_SEEN] = true;
       this.handleHttpRequest(req, res).catch((err) => {
         logEvent("warn", "request failed", { path: (req.url || "").split("?")[0], ...describeError(err) });
         if (!res.headersSent) {
@@ -115,8 +120,30 @@ export class RemoteAgentServer {
       srv.keepAliveTimeout = 30_000;
     };
 
+    // A 'clientError' listener replaces Node's default handling, so this mirrors it after logging.
+    const onClientError = (err: NodeJS.ErrnoException, socket: net.Socket) => {
+      const code = err.code || err.message;
+      const quietReset = (code === "ECONNRESET" || code === "EPIPE") && (socket as MarkedSocket)[REQUEST_SEEN];
+      if (!quietReset) {
+        this.appendWanLog(this.peerIpOf(socket), `HTTP client error ${code}`);
+      }
+      const pending = (socket as net.Socket & { _httpMessage?: { headersSent?: boolean } })._httpMessage;
+      if (!socket.writable || pending?.headersSent) {
+        socket.destroy();
+        return;
+      }
+      const status =
+        code === "HPE_HEADER_OVERFLOW"
+          ? "431 Request Header Fields Too Large"
+          : code === "ERR_HTTP_REQUEST_TIMEOUT"
+            ? "408 Request Timeout"
+            : "400 Bad Request";
+      socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+    };
+
     this.httpServer = http.createServer(reqHandler);
     applyHttpTimeouts(this.httpServer);
+    this.httpServer.on("clientError", onClientError);
 
     const tlsCreds = TlsManager.ensureCredentials();
     if (tlsCreds) {
@@ -128,6 +155,11 @@ export class RemoteAgentServer {
         reqHandler
       );
       applyHttpTimeouts(this.httpsServer);
+      this.httpsServer.on("clientError", onClientError);
+      this.httpsServer.on("tlsClientError", (err: NodeJS.ErrnoException, tlsSocket: TLSSocket) => {
+        this.appendWanLog(this.peerIpOf(tlsSocket), `TLS handshake failed: ${err.code || err.message}`);
+      });
+      this.httpsServer.on("secureConnection", (tlsSocket: TLSSocket) => this.watchForRequestlessTls(tlsSocket));
     }
 
     // Single-port HTTP + HTTPS (TLS) multiplexer with 5s first-byte anti-Slowloris timeout:
@@ -137,6 +169,7 @@ export class RemoteAgentServer {
       // TCP keepalive detects dead phone connections and keeps carrier NAT mappings warm.
       socket.setKeepAlive(true, 30_000);
       const firstByteTimer = setTimeout(() => {
+        this.appendWanLog(this.peerIpOf(socket), "TCP connection sent no data within 5s; closed");
         socket.destroy();
       }, 5_000);
       firstByteTimer.unref();
@@ -249,6 +282,7 @@ export class RemoteAgentServer {
 
   private setupWebSocketServer(): void {
     const onUpgrade = (req: http.IncomingMessage, socket: any, head: Buffer) => {
+      (socket as MarkedSocket)[REQUEST_SEEN] = true;
       const parsed = new URL(req.url || "/", "http://localhost");
       if (parsed.pathname !== "/ws") {
         socket.destroy();
@@ -601,6 +635,26 @@ export class RemoteAgentServer {
     }
     res.writeHead(200, { ...headers, "Content-Length": body.length });
     res.end(body);
+  }
+
+  private peerIpOf(socket: net.Socket | null | undefined): string {
+    const marked = socket as MarkedSocket | null | undefined;
+    return (marked?.remoteAddress || marked?._parent?.remoteAddress || "unknown").replace(/^::ffff:/i, "");
+  }
+
+  // Records secure connections that never carried a request, e.g. a client whose traffic stalls after the handshake.
+  private watchForRequestlessTls(tlsSocket: TLSSocket): void {
+    const ip = this.peerIpOf(tlsSocket);
+    if (!this.accessLogPath || this.auth.isPrivateLanOrLocalIp(ip)) return;
+    const opened = Date.now();
+    const protocol = tlsSocket.getProtocol() || "TLS";
+    tlsSocket.once("close", () => {
+      if ((tlsSocket as MarkedSocket)[REQUEST_SEEN]) return;
+      this.appendWanLog(
+        ip,
+        `${protocol} connected but closed after ${Math.round((Date.now() - opened) / 1000)}s without an HTTP request`
+      );
+    });
   }
 
   private appendWanLog(clientIp: string, line: string): void {
