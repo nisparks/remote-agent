@@ -1,6 +1,7 @@
 package com.nisparks.remoteagent;
 
 import android.app.Activity;
+import android.app.DownloadManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -10,6 +11,7 @@ import android.net.Network;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -21,6 +23,7 @@ import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.SslErrorHandler;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -69,6 +72,11 @@ public class MainActivity extends Activity {
     private static final int RELAY_PORT = 47321;
     // A direct remote page load that shows nothing for this long is retried through the relay.
     private static final long DIRECT_LOAD_TIMEOUT_MS = 15000;
+    // A loaded page whose live connection keeps dying soon after connecting is also moved to the relay.
+    private static final long SHORT_LIVED_CONNECTION_MS = 30000;
+    private static final long LIVE_DROP_WINDOW_MS = 180000;
+    private static final int LIVE_DROP_THRESHOLD = 3;
+    private static final long LIVE_DOWN_RELAY_AFTER_MS = 20000;
 
     private FrameLayout root;
     private WebView webView;
@@ -96,6 +104,10 @@ public class MainActivity extends Activity {
     // Origin the current web app page was requested from (the relay or the endpoint itself).
     private String currentPageBase = null;
     private Runnable directLoadWatchdog = null;
+    private long liveConnectionOnlineAt = 0;
+    private final java.util.ArrayDeque<Long> shortLivedDrops = new java.util.ArrayDeque<Long>();
+    private Runnable liveDownCheck = null;
+    private boolean activityResumed = false;
 
     private static final class ProbeResult {
         final String base;
@@ -143,6 +155,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
         if (webView == null) return;
         if (currentBase != null) {
             // The web app reconnects its own WebSocket and refreshes data; reloading here would
@@ -151,6 +164,14 @@ public class MainActivity extends Activity {
         } else if (!"settings".equals(localPageKind)) {
             connectBest(true);
         }
+    }
+
+    @Override
+    protected void onPause() {
+        activityResumed = false;
+        // Backgrounded pages lose their connections normally; that's not a sign of a hostile network.
+        cancelLiveDownCheck();
+        super.onPause();
     }
 
     @Override
@@ -375,7 +396,10 @@ public class MainActivity extends Activity {
         webView.setDownloadListener(new DownloadListener() {
             @Override
             public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
-                openExternally(url);
+                String target = externalUrl(url);
+                if (!downloadWithSystem(target, contentDisposition, mimetype)) {
+                    openExternally(target);
+                }
             }
         });
 
@@ -385,16 +409,51 @@ public class MainActivity extends Activity {
         ));
     }
 
-    private void openExternally(String url) {
-        // Relay URLs only work inside this app; hand other apps the real endpoint address instead.
+    /** Relay URLs only work inside this app; other apps get the real endpoint address instead. */
+    private String externalUrl(String url) {
         TlsRelay r = relay;
         if (url != null && currentPageRelayed && currentBase != null && r != null && url.startsWith(r.localBase() + "/")) {
-            url = currentBase + url.substring(r.localBase().length());
+            return currentBase + url.substring(r.localBase().length());
         }
+        return url;
+    }
+
+    private void openExternally(String url) {
+        url = externalUrl(url);
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
         } catch (Exception e) {
             Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
+     * Saves a download (e.g. an APK update) to Downloads with Android's download service. It uses the
+     * platform network stack, like the endpoint probe, so it works on networks that break browser
+     * connections, where handing the link to the browser left truncated APKs that wouldn't install.
+     */
+    private boolean downloadWithSystem(String url, String contentDisposition, String mimetype) {
+        try {
+            Uri uri = Uri.parse(url);
+            String scheme = uri.getScheme();
+            if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) return false;
+            // Android 17 blocks the system downloader from private-network addresses (local network
+            // protection); home-LAN links keep going to the browser, which works on the LAN.
+            if (isLocalNetworkHost(uri.getHost())) return false;
+            DownloadManager downloads = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            if (downloads == null) return false;
+            String fileName = URLUtil.guessFileName(url, contentDisposition, mimetype);
+            DownloadManager.Request request = new DownloadManager.Request(uri);
+            if (mimetype != null && !mimetype.isEmpty()) request.setMimeType(mimetype);
+            request.setTitle(fileName);
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName);
+            downloads.enqueue(request);
+            Toast.makeText(this, "Downloading " + fileName + " to Downloads. Open it there when it finishes.",
+                    Toast.LENGTH_LONG).show();
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -427,6 +486,18 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static boolean isLocalNetworkHost(String host) {
+        if (host == null || host.isEmpty()) return true;
+        String h = host.toLowerCase(java.util.Locale.ROOT);
+        if (h.startsWith("[") && h.endsWith("]")) h = h.substring(1, h.length() - 1);
+        if (h.equals("localhost") || h.endsWith(".local")) return true;
+        if (h.contains(":")) {
+            // IPv6 literal: loopback, link-local, or unique-local.
+            return h.equals("::1") || h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd");
+        }
+        return h.matches("^(127\\.|10\\.|192\\.168\\.|169\\.254\\.|172\\.(1[6-9]|2\\d|3[01])\\.|100\\.(6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])\\.)[0-9.]+$");
     }
 
     private static boolean isPrivateLanUrl(String url) {
@@ -669,6 +740,7 @@ public class MainActivity extends Activity {
 
     private void onEndpointFailed(String reason) {
         cancelDirectLoadWatchdog();
+        cancelLiveDownCheck();
         final String failedBase = currentBase;
         final boolean wasRelayed = currentPageRelayed;
         currentBase = null;
@@ -773,6 +845,9 @@ public class MainActivity extends Activity {
         if (webView == null) return;
         currentPageRelayed = relayed;
         currentPageBase = pageBase;
+        liveConnectionOnlineAt = 0;
+        shortLivedDrops.clear();
+        cancelLiveDownCheck();
         if (!relayed) {
             closeRelay();
         }
@@ -831,6 +906,78 @@ public class MainActivity extends Activity {
                 r.close();
             }
         }).start();
+    }
+
+    /**
+     * Tracks the page's live-connection state (reported by the web app). If the connection stays down for
+     * LIVE_DOWN_RELAY_AFTER_MS, or keeps dropping soon after connecting, while the app's own TLS stack still
+     * reaches the endpoint, this network is breaking the WebView's connections: reload through the relay.
+     */
+    private void onLiveConnectionState(String state) {
+        long now = SystemClock.elapsedRealtime();
+        if ("online".equals(state)) {
+            liveConnectionOnlineAt = now;
+            cancelLiveDownCheck();
+            return;
+        }
+        if ("auth".equals(state)) {
+            // A pairing problem, not a network one.
+            liveConnectionOnlineAt = 0;
+            cancelLiveDownCheck();
+            return;
+        }
+        long onlineAt = liveConnectionOnlineAt;
+        liveConnectionOnlineAt = 0;
+        if (onlineAt != 0 && now - onlineAt <= SHORT_LIVED_CONNECTION_MS) {
+            shortLivedDrops.addLast(now);
+            while (!shortLivedDrops.isEmpty() && now - shortLivedDrops.peekFirst() > LIVE_DROP_WINDOW_MS) {
+                shortLivedDrops.removeFirst();
+            }
+            if (shortLivedDrops.size() >= LIVE_DROP_THRESHOLD) {
+                shortLivedDrops.clear();
+                relayIfOnlyWebViewIsCutOff(false);
+            }
+        }
+        if (liveDownCheck == null && activityResumed) {
+            liveDownCheck = new Runnable() {
+                @Override
+                public void run() {
+                    liveDownCheck = null;
+                    relayIfOnlyWebViewIsCutOff(true);
+                }
+            };
+            handler.postDelayed(liveDownCheck, LIVE_DOWN_RELAY_AFTER_MS);
+        }
+        if ("offline".equals(state)) {
+            maybeSwitchEndpoint();
+        }
+    }
+
+    private void cancelLiveDownCheck() {
+        if (liveDownCheck != null) {
+            handler.removeCallbacks(liveDownCheck);
+            liveDownCheck = null;
+        }
+    }
+
+    private void relayIfOnlyWebViewIsCutOff(final boolean requireStillDown) {
+        if (destroyed || currentBase == null || currentPageRelayed || !currentBase.startsWith("https://")) return;
+        final String base = currentBase;
+        runInBackground(new Runnable() {
+            @Override
+            public void run() {
+                if (!probe(base).ok) return; // The app's own connection fails too; the relay wouldn't help.
+                postUi(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!base.equals(currentBase) || currentPageRelayed) return;
+                        if (requireStillDown && liveConnectionOnlineAt != 0) return; // Recovered meanwhile.
+                        preferRelay = true;
+                        loadBase(base);
+                    }
+                });
+            }
+        });
     }
 
     private void armDirectLoadWatchdog(final String pageBase) {
@@ -1165,9 +1312,7 @@ public class MainActivity extends Activity {
             postUi(new Runnable() {
                 @Override
                 public void run() {
-                    if ("offline".equals(state)) {
-                        maybeSwitchEndpoint();
-                    }
+                    onLiveConnectionState(state);
                 }
             });
         }
