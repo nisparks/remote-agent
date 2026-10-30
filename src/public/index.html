@@ -175,24 +175,16 @@
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                   <input id="fileUploadInput" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.md,.json,.txt" multiple style="display: none;" />
                 </label>
-                <select id="sessionModelSelect" class="composer-meta-select" title="Select AI Model">
+                <select id="sessionModelSelect" class="composer-meta-select" title="Model">
                   <option value="auto">Auto</option>
-                  <option value="gemini-4-argon">Gemini 4 Argon</option>
-                  <option value="claude-opus-5.5">Claude Opus 5.5</option>
-                  <option value="claude-sonnet-5.5">Claude Sonnet 5.5</option>
-                  <option value="gpt-6.1-sol">GPT-6.1 Sol</option>
-                  <option value="gpt-6-astra">GPT-6 Astra</option>
                 </select>
-                <select id="sessionEffortSelect" class="composer-meta-select" title="Reasoning Effort">
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
+                <select id="sessionAutoTierSelect" class="composer-meta-select" title="Auto routing tier" style="display: none;"></select>
+                <select id="sessionEffortSelect" class="composer-meta-select" title="Reasoning effort">
                   <option value="high" selected>High</option>
-                  <option value="xhigh">XHigh</option>
-                  <option value="max">Max</option>
                 </select>
-                <select id="sessionContextTierSelect" class="composer-meta-select" title="Context Window Tier">
-                  <option value="default">Standard Ctx</option>
-                  <option value="long_context">1M Long Ctx</option>
+                <select id="sessionContextTierSelect" class="composer-meta-select" title="Context window" style="display: none;">
+                  <option value="default">Standard ctx</option>
+                  <option value="long_context">Long ctx</option>
                 </select>
                 <select id="deliveryModeSelect" class="composer-meta-select" title="Message delivery mode">
                   <option value="immediate">Steer now</option>

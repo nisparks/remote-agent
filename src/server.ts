@@ -12,6 +12,13 @@ import { WebSocketServer, type WebSocket as WsClient } from "ws";
 import { AuthManager } from "./auth.js";
 import { DesktopAppBridge } from "./desktop-bridge.js";
 import { describeError, enableFileLogging, getLogFilePath, logEvent } from "./logger.js";
+import {
+  applySessionModels,
+  normalizeDesktopCatalog,
+  resolveModelSelection,
+  type ModelCatalog,
+  type ModelSelection,
+} from "./model-catalog.js";
 import { CopilotSdkEngine } from "./sdk-engine.js";
 import { SessionStateStore } from "./session-store.js";
 import { TlsManager } from "./tls.js";
@@ -27,9 +34,55 @@ const PUBLIC_DIR = fs.existsSync(path.join(__dirname, "public"))
   ? path.join(__dirname, "public")
   : path.join(PROJECT_ROOT, "src", "public");
 const RELEASES_DIR = path.join(PROJECT_ROOT, "releases");
+const MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
+const SESSION_MODEL_CATALOG_TTL_MS = 60 * 1000;
+const MODEL_INTENT_TTL_MS = 2 * 60 * 60 * 1000;
+const MODEL_CATALOG_CACHE_PATH = path.join(os.homedir(), ".copilot", "remote-agent-cache", "model-catalog.json");
 // Set on a client socket once it carries an HTTP request or WebSocket upgrade.
 const REQUEST_SEEN = Symbol("remoteAgent.requestSeen");
 type MarkedSocket = net.Socket & { [REQUEST_SEEN]?: boolean; _parent?: net.Socket };
+
+/** A model change refused before reaching the desktop app, with the reason to show the user. */
+class ModelChangeRefused extends Error {
+  constructor(
+    message: string,
+    readonly status = 409
+  ) {
+    super(message);
+  }
+}
+
+/** Whether two selections run the session the same way (Auto ignores effort; other models ignore levels). */
+function sameModelSelection(a: ModelSelection, b: ModelSelection): boolean {
+  if (a.model !== b.model) return false;
+  if ((a.contextTier || "default") !== (b.contextTier || "default")) return false;
+  return b.model === "auto"
+    ? (a.autoTier || "") === (b.autoTier || "")
+    : (a.reasoningEffort || "") === (b.reasoningEffort || "");
+}
+
+/** HTTP status and body for a model switch that was refused or failed. */
+function describeModelSwitchError(
+  sessionId: string,
+  model: string,
+  err: unknown
+): [number, { error: string; blocked?: boolean }] {
+  if (err instanceof ModelChangeRefused) return [err.status, { error: err.message }];
+  const message = err instanceof Error ? err.message : String(err);
+  logEvent("warn", "model switch failed", { sessionId, model, error: message });
+  if (/has not been confirmed/i.test(message)) {
+    // The app fences a session after a switch it couldn't confirm; only an app restart clears it.
+    return [
+      409,
+      {
+        error:
+          "The desktop Copilot app is still waiting to confirm an earlier model change for this session, so it won't accept model changes or new messages. Restart the GitHub Copilot app on the desktop to clear it.",
+        blocked: true,
+      },
+    ];
+  }
+  return [502, { error: message.replace(/^Failed to set session model:\s*/i, "") || message }];
+}
 
 export interface RemoteAgentServerOptions {
   port?: number;
@@ -75,6 +128,16 @@ export class RemoteAgentServer {
   private allowLocalhostBypass: boolean;
   private enableWanAutoStart: boolean;
   private accessLogPath: string | null;
+  private modelCatalog: ModelCatalog | null = null;
+  private modelCatalogStale = false;
+  private modelCatalogRequest: Promise<ModelCatalog> | null = null;
+  private sessionModelCatalogs = new Map<string, { catalog: ModelCatalog; expiresAt: number }>();
+  /**
+   * Model choices made while a change was still waiting for the session's turn to end. The newest choice
+   * wins and is applied once the session is idle, so steps never reach the runtime out of order.
+   */
+  private modelIntents = new Map<string, { selection: ModelSelection & { model: string }; expiresAt: number }>();
+  private modelIntentTimer: NodeJS.Timeout | null = null;
 
   constructor(options: RemoteAgentServerOptions = {}) {
     this.port = options.port ?? Number(process.env.PORT || 4321);
@@ -252,6 +315,10 @@ export class RemoteAgentServer {
       clearInterval(this.wsHeartbeatTimer);
       this.wsHeartbeatTimer = null;
     }
+    if (this.modelIntentTimer) {
+      clearInterval(this.modelIntentTimer);
+      this.modelIntentTimer = null;
+    }
     this.store.stopBackgroundWork();
     if (this.stateWatcher) {
       this.stateWatcher.close();
@@ -371,6 +438,16 @@ export class RemoteAgentServer {
         type: "desktop_status",
         ...status,
       });
+      if ((status as { connected?: boolean }).connected) {
+        // The account (and with it the catalog) may have changed while the app was away.
+        this.modelCatalogStale = true;
+        this.sessionModelCatalogs.clear();
+        void this.getModelCatalog();
+      } else if (this.modelIntents.size > 0) {
+        // A restarted app starts its sessions over, so choices waiting for a turn to end are dropped.
+        this.modelIntents.clear();
+        this.afterModelChange();
+      }
     });
 
     this.bridge.on("workspaces_updated", () => {
@@ -380,7 +457,16 @@ export class RemoteAgentServer {
       });
     });
 
+    this.bridge.on("external_model_change", ({ sessionId }: { sessionId: string }) => {
+      // A newer choice made in the desktop app wins over one still waiting here.
+      if (this.modelIntents.delete(sessionId)) this.afterModelChange();
+    });
+
     this.bridge.on("session_event", ({ sessionId, event }) => {
+      // Sub-agents report their own events; only the session's own idle means its turn has ended.
+      if (event?.type === "session.idle" && !event.agentId && sessionId) {
+        this.runModelIntent(sessionId);
+      }
       if (event && event.type === "user.message" && sessionId) {
         const content = String((event.data as Record<string, unknown>)?.content || "");
         const list = this.pendingSteering.get(sessionId) || [];
@@ -577,7 +663,7 @@ export class RemoteAgentServer {
     const accounts = this.store.getGitHubAccounts();
     const primaryAccount = accounts.find((a) => a.isDefault)?.login || accounts[0]?.login || null;
     const quota = await this.store.getCopilotQuota();
-    const availableModels = this.store.getAvailableModels();
+    const availableModels = (await this.getModelCatalog()).models.map((m) => ({ id: m.id, name: m.name }));
     const peerHosts = this.store.listPeerHosts();
     const apkPath = path.join(RELEASES_DIR, "RemoteAgent-android.apk");
     const setupPath = path.join(RELEASES_DIR, "RemoteAgent-Desktop-Setup.exe");
@@ -655,6 +741,306 @@ export class RemoteAgentServer {
         `${protocol} connected but closed after ${Math.round((Date.now() - opened) / 1000)}s without an HTTP request`
       );
     });
+  }
+
+  /**
+   * The account's model catalog, asked from the desktop app (`list_models`) and cached for a few minutes.
+   * When the app can't be reached, the last good copy on disk and then the app's own cached list are used.
+   */
+  private async getModelCatalog(forceRefresh = false): Promise<ModelCatalog> {
+    const cached = this.modelCatalog;
+    const fresh =
+      cached?.source === "desktop" &&
+      !this.modelCatalogStale &&
+      Date.now() - Date.parse(cached.fetchedAt) < MODEL_CATALOG_TTL_MS;
+    if (cached && fresh && !forceRefresh) return cached;
+    if (this.modelCatalogRequest) return this.modelCatalogRequest;
+    this.modelCatalogRequest = (async () => {
+      if (this.bridge.isConnected()) {
+        try {
+          const raw = await this.bridge.listModels();
+          const catalog = normalizeDesktopCatalog(raw, "desktop");
+          if (catalog.models.length > 0) {
+            this.modelCatalog = catalog;
+            this.modelCatalogStale = false;
+            this.saveModelCatalog(raw);
+            return catalog;
+          }
+        } catch (err) {
+          logEvent("warn", "model catalog request failed", describeError(err));
+        }
+      }
+      const fallback = this.modelCatalog ?? this.loadSavedModelCatalog() ?? this.appStateModelCatalog();
+      this.modelCatalog = fallback;
+      return fallback;
+    })().finally(() => {
+      this.modelCatalogRequest = null;
+    });
+    return this.modelCatalogRequest;
+  }
+
+  private saveModelCatalog(raw: Record<string, unknown>): void {
+    if (this.port === 0) return; // Test servers never touch the user's cache.
+    try {
+      fs.mkdirSync(path.dirname(MODEL_CATALOG_CACHE_PATH), { recursive: true });
+      fs.writeFileSync(MODEL_CATALOG_CACHE_PATH, JSON.stringify(raw), "utf8");
+    } catch {
+      // Best effort
+    }
+  }
+
+  private loadSavedModelCatalog(): ModelCatalog | null {
+    if (this.port === 0) return null;
+    try {
+      const raw = JSON.parse(fs.readFileSync(MODEL_CATALOG_CACHE_PATH, "utf8")) as unknown;
+      const catalog = normalizeDesktopCatalog(raw, "cache");
+      if (catalog.models.length === 0) return null;
+      catalog.fetchedAt = fs.statSync(MODEL_CATALOG_CACHE_PATH).mtime.toISOString();
+      return catalog;
+    } catch {
+      return null;
+    }
+  }
+
+  private appStateModelCatalog(): ModelCatalog {
+    const models = this.store.getAvailableModels();
+    return {
+      models,
+      autoTiers: [],
+      defaultAutoTier: this.store.getDefaultAutoTier() ?? "balance",
+      source: models.length > 1 ? "app-state" : "fallback",
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * The models and Auto levels one session accepts. Sessions can belong to accounts with different
+   * offerings, and the runtime rejects anything outside the session's own list, so a loaded session's
+   * list is authoritative (no `auto_tiers` there means plain Auto only). Unloaded sessions can't list
+   * their models; the account's levels stand in for display, as in the desktop picker, and are confirmed
+   * by loading the session before one is sent (see `getVerifiedSessionModelCatalog`).
+   */
+  private async getSessionModelCatalog(
+    sessionId: string,
+    forceRefresh = false,
+    refreshAccount = forceRefresh
+  ): Promise<ModelCatalog> {
+    const account = await this.getModelCatalog(refreshAccount);
+    const cached = this.sessionModelCatalogs.get(sessionId);
+    if (cached && !forceRefresh && Date.now() < cached.expiresAt) return cached.catalog;
+    if (!this.bridge.isConnected()) return { ...account, autoTiers: [], sessionId };
+    try {
+      const raw = await this.bridge.listSessionModels(sessionId);
+      return this.cacheSessionModelCatalog(sessionId, applySessionModels(account, raw, sessionId), SESSION_MODEL_CATALOG_TTL_MS);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const catalog: ModelCatalog = { ...account, autoTiers: [], sessionId };
+      // The app's wording for a session whose runtime isn't loaded right now.
+      if (/after the cloud session is connected/i.test(message) && account.autoTiers.length > 0) {
+        catalog.autoTiers = account.autoTiers;
+        catalog.autoTiersUnverified = true;
+      } else {
+        logEvent("info", "session model list unavailable", { sessionId, error: message });
+      }
+      return this.cacheSessionModelCatalog(sessionId, catalog, 15_000);
+    }
+  }
+
+  /**
+   * The session's catalog with its Auto levels confirmed by the session itself. An unloaded session is
+   * loaded first, as opening it in the desktop app would. Throws when the app has blocked the session
+   * (an unconfirmed model change); other load failures leave plain Auto only.
+   */
+  private async getVerifiedSessionModelCatalog(sessionId: string): Promise<ModelCatalog> {
+    let catalog = await this.getSessionModelCatalog(sessionId, true, false);
+    if (!catalog.autoTiersUnverified) return catalog;
+    // Bounded well inside the phone's request timeout.
+    const deadline = Date.now() + 25_000;
+    try {
+      await this.bridge.resumeSession(sessionId);
+      while (Date.now() < deadline) {
+        catalog = await this.getSessionModelCatalog(sessionId, true, false);
+        if (!catalog.autoTiersUnverified) return catalog;
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/has not been confirmed/i.test(message)) throw err;
+      logEvent("warn", "couldn't load session to confirm its Auto levels", { sessionId, error: message });
+    }
+    const plain: ModelCatalog = { ...catalog, autoTiers: [], autoTiersUnverified: undefined };
+    return this.cacheSessionModelCatalog(sessionId, plain, 15_000);
+  }
+
+  private cacheSessionModelCatalog(sessionId: string, catalog: ModelCatalog, ttlMs: number): ModelCatalog {
+    this.sessionModelCatalogs.delete(sessionId);
+    this.sessionModelCatalogs.set(sessionId, { catalog, expiresAt: Date.now() + ttlMs });
+    if (this.sessionModelCatalogs.size > 200) {
+      const oldest = this.sessionModelCatalogs.keys().next().value;
+      if (oldest) this.sessionModelCatalogs.delete(oldest);
+    }
+    return catalog;
+  }
+
+  private afterModelChange(): void {
+    this.store.invalidateSessionsList();
+    this.broadcast({ type: "sessions_updated", timestamp: new Date().toISOString() });
+  }
+
+  /** A choice still waiting for the session's turn to end, if any. */
+  private activeModelIntent(sessionId: string): (ModelSelection & { model: string }) | undefined {
+    const intent = this.modelIntents.get(sessionId);
+    if (intent && Date.now() > intent.expiresAt) this.modelIntents.delete(sessionId);
+    return this.modelIntents.get(sessionId)?.selection;
+  }
+
+  /** What the session will run next: a held choice, a change the app is holding, or what it runs now. */
+  private currentModelChoice(sessionId: string): ModelSelection | null {
+    return this.activeModelIntent(sessionId) ?? this.bridge.getQueuedSelection(sessionId) ?? this.appliedModelSelection(sessionId);
+  }
+
+  /**
+   * Whether the session is mid-turn. Its own turn events are exact; before one has been seen (e.g. after
+   * a restart mid-turn), the session list's running state stands in.
+   */
+  private isSessionBusy(sessionId: string): boolean {
+    const known = this.bridge.isSessionBusy(sessionId);
+    if (known !== undefined) return known;
+    return Boolean(this.store.listSessions(this.bridge.getLiveWorkspaces()).find((s) => s.id === sessionId)?.isRunning);
+  }
+
+  /**
+   * The selection the session runs: its persisted selection in data.db, with the runtime's own record
+   * filling in sessions that never changed model, and the Auto level (known only to the bridge and the
+   * event log). Null when the session is unknown. data.db already shows changes the app is holding for
+   * the end of a turn, so this is only trustworthy while nothing is queued.
+   */
+  private appliedModelSelection(sessionId: string, maxStaleMs = 0): ModelSelection | null {
+    const row = this.store.getSessionModelConfig(sessionId);
+    const recorded = this.store.getRecordedModelState(sessionId, maxStaleMs);
+    const model = row?.model ?? recorded.model;
+    if (!model) return null;
+    const fromRow = Boolean(row?.model);
+    const selection: ModelSelection = {
+      model,
+      reasoningEffort: fromRow ? row?.reasoningEffort : recorded.reasoningEffort,
+      contextTier: (fromRow ? row?.contextTier : recorded.contextTier) === "long_context" ? "long_context" : "default",
+    };
+    if (model === "auto") {
+      selection.reasoningEffort = undefined;
+      selection.autoTier = this.bridge.getSessionAutoTier(sessionId) ?? recorded.autoTier;
+    }
+    return selection;
+  }
+
+  /**
+   * Sends a resolved selection to the desktop app, or holds it as the session's pending choice while the
+   * session is mid-turn or an earlier change is still waiting (as the desktop picker does), so nothing sent
+   * from here ever sits in the app's queue behind another change. Auto levels and long context never
+   * change in the same step: the runtime refuses Fusion levels while long context is on, and a refused
+   * switch blocks the session until the desktop app restarts.
+   */
+  private async applyModelSelection(
+    sessionId: string,
+    sel: ModelSelection & { model: string },
+    catalog: ModelCatalog
+  ): Promise<{ selection: ModelSelection; queued: boolean; notes: string[] }> {
+    const hold = () => {
+      this.modelIntents.set(sessionId, { selection: sel, expiresAt: Date.now() + MODEL_INTENT_TTL_MS });
+      this.watchModelIntents();
+      return { selection: sel, queued: true, notes: [] as string[] };
+    };
+    if (this.activeModelIntent(sessionId) || this.bridge.getQueuedSelection(sessionId) || this.isSessionBusy(sessionId)) {
+      return hold();
+    }
+    const applied = this.appliedModelSelection(sessionId);
+    if (!applied?.model) {
+      throw new ModelChangeRefused("The desktop Copilot app has no model recorded for this session.", 404);
+    }
+    // data.db changes when a change is queued and the event log when the runtime applies it; if either
+    // says long context (or Auto), treat it as on.
+    const runtime = this.store.getRecordedModelState(sessionId);
+    const longContextOn = applied.contextTier === "long_context" || runtime.contextTier === "long_context";
+    const onAuto = applied.model === "auto" || runtime.model === "auto";
+    const notes: string[] = [];
+    const runtimeAgrees =
+      (!runtime.model || runtime.model === applied.model) &&
+      (!runtime.contextTier || runtime.contextTier === applied.contextTier);
+    // E.g. a held change cancelled by choosing the current model again: nothing to send. (Auto levels are
+    // re-sent, since a remembered level can be stale and re-sending one is harmless.)
+    if (sel.model !== "auto" && sameModelSelection(applied, sel) && runtimeAgrees) {
+      return { selection: applied, queued: false, notes };
+    }
+    let firstStep: (ModelSelection & { model: string }) | null = null;
+    if (sel.model === "auto" && longContextOn) {
+      if (applied.model === "auto") {
+        if (!sel.autoTier) return { selection: applied, queued: false, notes };
+        throw new ModelChangeRefused(
+          "This session is on Auto with long context, and Auto levels can't be combined with long context. Pick another model first, then Auto."
+        );
+      }
+      // Re-selecting the current model must itself be a switch the runtime accepts.
+      const reset = resolveModelSelection(catalog, applied, { model: applied.model, contextTier: "default" });
+      if (!reset.ok) {
+        throw new ModelChangeRefused(
+          `Long context has to be turned off before choosing an Auto level, and ${applied.model} can't be re-selected to do that (${reset.error}) Turn long context off in the desktop app first.`
+        );
+      }
+      firstStep = { ...reset.selection, contextTier: "default" };
+      notes.push("Long context was turned off first, since Auto doesn't use it.");
+    } else if (sel.model !== "auto" && onAuto && sel.contextTier === "long_context") {
+      firstStep = { ...sel, contextTier: "default" };
+    }
+    if (firstStep) {
+      const first = await this.bridge.setSessionModel(sessionId, firstStep);
+      if (first.queued) return hold();
+    }
+    const result = await this.bridge.setSessionModel(sessionId, sel);
+    if (result.notice) notes.push(result.notice);
+    return {
+      selection: {
+        model: result.model,
+        reasoningEffort: result.reasoningEffort,
+        contextTier: result.contextTier,
+        autoTier: result.autoTier,
+      },
+      queued: result.queued,
+      notes,
+    };
+  }
+
+  /** Applies the session's held choice once it is idle; otherwise keeps holding it. */
+  private runModelIntent(sessionId: string): void {
+    const intent = this.activeModelIntent(sessionId);
+    if (!intent || !this.bridge.isConnected()) return;
+    if (this.bridge.getQueuedSelection(sessionId) || this.isSessionBusy(sessionId)) return;
+    this.modelIntents.delete(sessionId);
+    void (async () => {
+      const catalog = await this.getSessionModelCatalog(sessionId);
+      return this.applyModelSelection(sessionId, intent, catalog);
+    })()
+      .then((outcome) =>
+        logEvent("info", "pending model change applied", { sessionId, model: intent.model, queued: outcome.queued })
+      )
+      .catch((err) => {
+        const [, body] = describeModelSwitchError(sessionId, intent.model, err);
+        this.broadcast({ type: "model_switch_failed", sessionId, error: body.error });
+      })
+      .finally(() => this.afterModelChange());
+  }
+
+  /** Re-checks held choices now and then, in case a session's idle event was missed. */
+  private watchModelIntents(): void {
+    if (this.modelIntentTimer) return;
+    this.modelIntentTimer = setInterval(() => {
+      if (this.modelIntents.size === 0) {
+        if (this.modelIntentTimer) clearInterval(this.modelIntentTimer);
+        this.modelIntentTimer = null;
+        return;
+      }
+      for (const sessionId of [...this.modelIntents.keys()]) this.runModelIntent(sessionId);
+    }, 15_000);
+    this.modelIntentTimer.unref?.();
   }
 
   private appendWanLog(clientIp: string, line: string): void {
@@ -1197,6 +1583,11 @@ export class RemoteAgentServer {
         return;
       }
 
+      if (pathname === "/api/models" && method === "GET") {
+        this.sendJson(res, 200, await this.getModelCatalog(parsedUrl.searchParams.get("refresh") === "1"));
+        return;
+      }
+
       if (pathname === "/api/sessions" && method === "GET") {
         const sessions = this.store.listSessions(this.bridge.getLiveWorkspaces());
         this.sendJson(res, 200, { sessions });
@@ -1219,6 +1610,7 @@ export class RemoteAgentServer {
             activityStatus: "idle" as const,
             mode: "interactive" as const,
             model: "auto",
+            modelUnset: true,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             counts: { turns: 0, artifacts: 0, images: 0, models3d: 0, todos: 0, todosDone: 0 },
@@ -1261,9 +1653,26 @@ export class RemoteAgentServer {
               ? details.awaitingPlanApproval
               : null;
           summary.awaitingPermission = details.awaitingPermission;
-          if (details.selectedModel && summary.model === "auto") {
-            summary.model = details.selectedModel;
+          // Sessions without a listed model (never switched, or older than the list) use what the
+          // runtime recorded; "auto" can be a real selection, so listed models are kept. The event log is
+          // only read when needed, and display may reuse a recent read since busy logs change constantly.
+          const liveTier = summary.model === "auto" ? this.bridge.getSessionAutoTier(sessionId) : undefined;
+          if (summary.modelUnset || (summary.model === "auto" && !liveTier)) {
+            const applied = this.appliedModelSelection(sessionId, 15_000);
+            if (summary.modelUnset && applied?.model) {
+              summary.model = applied.model;
+              summary.reasoningEffort = applied.reasoningEffort;
+              summary.contextTier = applied.contextTier;
+            } else if (summary.modelUnset && details.selectedModel) {
+              summary.model = details.selectedModel;
+            }
+            if (summary.model === "auto") summary.autoTier = applied?.autoTier || details.autoTier;
+          } else if (liveTier) {
+            summary.autoTier = liveTier;
           }
+          // The newest choice still waiting for the session's turn to end is what it runs next.
+          const pendingModel = this.activeModelIntent(sessionId) ?? this.bridge.getQueuedSelection(sessionId);
+          if (pendingModel) summary.pendingModel = pendingModel;
           if (details.sessionCwd && !summary.cwd) {
             summary.cwd = details.sessionCwd;
           }
@@ -1549,6 +1958,15 @@ export class RemoteAgentServer {
           return;
         }
 
+        if (subRoute === "models" && method === "GET") {
+          this.sendJson(
+            res,
+            200,
+            await this.getSessionModelCatalog(sessionId, parsedUrl.searchParams.get("refresh") === "1")
+          );
+          return;
+        }
+
         if (subRoute === "mode" && method === "POST") {
           const body = await this.readJsonBody<{ mode: SessionMode }>(req);
           if (!["interactive", "plan", "autopilot"].includes(body.mode)) {
@@ -1557,50 +1975,99 @@ export class RemoteAgentServer {
           }
           const ok = this.bridge.setSessionMode(sessionId, body.mode);
           this.store.updateSessionConfigInDb(sessionId, { mode: body.mode });
+          this.store.invalidateSessionsList();
           this.broadcast({ type: "sessions_updated", timestamp: new Date().toISOString() });
           this.sendJson(res, 200, { ok, mode: body.mode });
           return;
         }
 
         if (subRoute === "config" && method === "POST") {
-          const body = await this.readJsonBody<{
-            model?: string;
-            reasoningEffort?: string;
-            contextTier?: string;
-            mode?: SessionMode;
-          }>(req);
+          const body = await this.readJsonBody<
+            ModelSelection & {
+              mode?: SessionMode;
+            }
+          >(req);
 
           if (body.mode && ["interactive", "plan", "autopilot"].includes(body.mode)) {
             this.bridge.setSessionMode(sessionId, body.mode);
-          }
-          if (body.model || body.reasoningEffort || body.contextTier) {
-            const currentSummary = this.store
-              .listSessions(this.bridge.getLiveWorkspaces())
-              .find((s) => s.id === sessionId);
-            const targetModel = body.model || currentSummary?.model || "auto";
-            this.bridge.setSessionModel(
-              sessionId,
-              targetModel,
-              body.reasoningEffort,
-              body.contextTier
-            );
+            this.store.updateSessionConfigInDb(sessionId, { mode: body.mode });
+            this.store.invalidateSessionsList();
           }
 
-          const dbUpdated = this.store.updateSessionConfigInDb(sessionId, {
-            model: body.model,
-            reasoningEffort: body.reasoningEffort,
-            contextTier: body.contextTier,
-            mode: body.mode,
-          });
-          this.broadcast({ type: "sessions_updated", timestamp: new Date().toISOString() });
-          this.sendJson(res, 200, {
-            ok: true,
-            dbUpdated,
-            model: body.model,
-            reasoningEffort: body.reasoningEffort,
-            contextTier: body.contextTier,
-            mode: body.mode,
-          });
+          const patch: ModelSelection = {
+            model: body.model || undefined,
+            reasoningEffort: body.reasoningEffort || undefined,
+            contextTier: body.contextTier || undefined,
+            autoTier: body.autoTier || undefined,
+          };
+          if (!patch.model && !patch.reasoningEffort && !patch.contextTier && !patch.autoTier) {
+            this.broadcast({ type: "sessions_updated", timestamp: new Date().toISOString() });
+            this.sendJson(res, 200, { ok: true, mode: body.mode });
+            return;
+          }
+          if (!this.bridge.isConnected()) {
+            this.sendJson(res, 503, {
+              error: "The desktop Copilot app isn't connected, so the model can't be changed right now.",
+            });
+            return;
+          }
+
+          const before = this.currentModelChoice(sessionId);
+          if (!before?.model) {
+            this.sendJson(res, 404, {
+              error: "The desktop Copilot app has no model recorded for this session, so it can't be changed from here.",
+            });
+            return;
+          }
+          let catalog: ModelCatalog;
+          try {
+            // Auto levels must come from the session itself; an unloaded session is loaded to ask it.
+            catalog =
+              (patch.model || before.model) === "auto"
+                ? await this.getVerifiedSessionModelCatalog(sessionId)
+                : await this.getSessionModelCatalog(sessionId);
+          } catch (err) {
+            this.sendJson(res, ...describeModelSwitchError(sessionId, patch.model || "auto", err));
+            return;
+          }
+          // Choices build on the newest one still waiting for the session's turn to end. Read it again:
+          // the turn may have ended (and a held choice run) while the catalog loaded.
+          const current = this.currentModelChoice(sessionId) ?? before;
+          const resolved = resolveModelSelection(catalog, current, patch);
+          if (!resolved.ok) {
+            this.sendJson(res, 400, { error: resolved.error });
+            return;
+          }
+
+          // Skip no-ops: they would only add a model change to the session's history.
+          const sel = resolved.selection;
+          if (sameModelSelection(current, sel)) {
+            this.sendJson(res, 200, {
+              ok: true,
+              ...sel,
+              adjustments: resolved.adjustments,
+              unchanged: true,
+              queued: Boolean(this.activeModelIntent(sessionId) || this.bridge.getQueuedSelection(sessionId)),
+              mode: body.mode,
+            });
+            return;
+          }
+
+          try {
+            // The desktop app validates, applies, and persists the selection, or explains why it can't.
+            const outcome = await this.applyModelSelection(sessionId, sel, catalog);
+            this.afterModelChange();
+            this.sendJson(res, 200, {
+              ok: true,
+              ...outcome.selection,
+              queued: outcome.queued,
+              adjustments: [...resolved.adjustments, ...outcome.notes],
+              mode: body.mode,
+            });
+          } catch (err) {
+            this.afterModelChange();
+            this.sendJson(res, ...describeModelSwitchError(sessionId, sel.model, err));
+          }
           return;
         }
 

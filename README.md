@@ -17,7 +17,7 @@ Monitor, inspect (high-res images, 3D `.stl` meshes, Markdown docs, and Git diff
 | **🖼️ Pinch-to-Zoom Lightbox & Touch Markup Studio** | Tap any image or CAD render to open in **🔍 Zoom / Pan Mode** (2-finger pinch-zoom up to `8×`, 1-finger pan, double-tap `2.5×`). Tap **`✏️ Annotate`** to draw freehand redlines and send the annotated PNG straight into the active Copilot session. |
 | **🧊 Interactive 3D `.stl` CAD Viewer** | Built-in binary & ASCII `.stl` mesh parser with 60fps touch orbit, pinch-to-zoom, pan, wireframe toggle, and 1-tap 3D snapshot annotation. |
 | **📲 1-Tap Over-The-Air `.apk` / `.exe` Updates** | Automatically indexes build outputs (`releases/`, `app/build/outputs/apk/`) per session and renders **`⬇ INSTALL APK`** cards inline in chat and in the Artifacts tab. |
-| **🎛️ Full Model, Reasoning & Context Control** | Switch AI Model (`Auto`, `Gemini 4 Argon`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-6.1 Sol`, `GPT-6 Astra`), Reasoning Effort (`Low`–`Max`), Context Tier (`Standard` / `1M Long Ctx`), and Execution Mode (`Interactive`, `Plan`, `Autopilot`) live from the mobile composer bar (`POST /api/sessions/:id/config`). |
+| **🎛️ Full Model, Reasoning & Context Control** | The composer's model picker mirrors the desktop app's own: the models, Auto levels (`Standard` / `High` / `Max`), reasoning efforts, and long-context windows come live from the desktop app for each session (`GET /api/sessions/:id/models`), so new models appear without an update. Switch them, plus Execution Mode (`Interactive`, `Plan`, `Autopilot`), from the mobile composer bar (`POST /api/sessions/:id/config`). |
 | **📊 Monthly Copilot Quota & Session Telemetry** | Displays live monthly GitHub Copilot Premium Interactions quota (`% remaining`, used vs. entitlement, reset date) and per-session token/AIU breakdown in the **Plan & Quota** tab, drawer, and status bar. |
 | **🔄 Live UI Hot-Reload & Cache-Busting** | Automatically versions `/styles.css` and `/app.js` by content SHA-1 (`?v=<uiVersion>`) and broadcasts `ui_reload` over WebSocket whenever `src/public/*` changes, plus a 1-tap `↻` Reload button in the mobile top bar. |
 | **🔐 Rolling 6-Digit MFA & 1-Tap Phone Push Login** | Temporarily pair any new desktop, laptop, or Chromebook on LAN or WAN without typing a long token: enter the **6-digit RFC 6238 TOTP code** (from your paired Android app or **Google / Microsoft Authenticator**), **or** click **Request 1-Tap Approval on Paired Phone** to approve a time-limited session (`1h`, `8h`, `24h`, `30d`) with 1 tap on your phone. |
@@ -168,6 +168,13 @@ If you run GitHub Copilot across multiple machines (for example, a primary Windo
   - Tap **`✏️ Annotate`** to draw redline feedback on the image and send it directly to Copilot or add it to your Review Queue.
 - **Android Back-Swipe Gesture**:
   - Swiping back from the edge of your Android screen cleanly closes any open image lightbox, 3D `.stl` viewer, document viewer, QR modal, or session drawer before exiting the app.
+- **Model Picker** (below the composer):
+  - Lists exactly what the session can use, grouped like the desktop picker (**Powerful**, **Versatile**, **Lightweight**), with each model's relative cost (`$`–`$$$$`) and any discount.
+  - Choose **Auto** to reveal its level picker (**Standard**, **High**, **Max**) when the session's account offers levels. The effort picker shows only the efforts the chosen model supports, and the context picker appears only for models with a long-context window.
+  - The level picker shows **Level?** when the desktop app hasn't recorded the session's level (it doesn't record level-only changes); pick a level to set it.
+  - Changes made while Copilot is mid-turn are held and shown with a dashed outline; they take effect when the turn ends, and the newest choice wins.
+  - Choosing an Auto level while long context is on first switches the current model back to its standard window, because Copilot refuses Auto levels with long context. If the session is busy, both steps run once the turn ends.
+  - If the desktop app ever reports that it is "waiting to confirm an earlier model change", that session won't accept changes or messages until the GitHub Copilot app is restarted on the desktop.
 
 ---
 

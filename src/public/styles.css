@@ -1156,6 +1156,49 @@ html, body {
 .composer-meta-select:focus {
   outline: none;
 }
+.composer-meta-select:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+/* A model switch queued until the current turn ends. */
+.composer-meta-select.pending {
+  border-style: dashed;
+  font-style: italic;
+}
+/* Short status messages, e.g. the result of a model switch. Sits above the composer. */
+.app-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(140px + var(--safe-bottom));
+  transform: translate(-50%, 12px);
+  max-width: min(92vw, 520px);
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 9000;
+}
+.app-toast.visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  pointer-events: auto;
+}
+.app-toast-ok {
+  border-color: rgba(63, 185, 80, 0.6);
+}
+.app-toast-warn {
+  border-color: rgba(210, 153, 34, 0.7);
+}
+.app-toast-error {
+  border-color: rgba(248, 81, 73, 0.75);
+}
 .composer-context-text {
   font-size: 11px;
   color: var(--text-muted);

@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { DETAIL_EVENT_TYPES, EventLogIndexer, JsonlLineScanner, fileIdentity } from "./event-log.js";
+import { modelsFromAppState, type CatalogModel } from "./model-catalog.js";
 import type {
   ArtifactCategory,
   ArtifactItem,
@@ -170,6 +171,108 @@ function parseSimpleYaml(text: string): Record<string, string> {
   return result;
 }
 
+export interface RecordedModelState {
+  model?: string;
+  reasoningEffort?: string;
+  /** "default" or "long_context". */
+  contextTier?: string;
+  /** The Auto level, when the session is on Auto and the level was recorded. */
+  autoTier?: string;
+}
+
+const MODEL_STATE_EVENT = /"type"\s*:\s*"session\.(?:start|resume|model_change)"/;
+const MODEL_STATE_CHUNK_BYTES = 256 * 1024;
+const MODEL_STATE_MAX_SCAN_BYTES = 32 * 1024 * 1024;
+const MODEL_STATE_MAX_LINE_BYTES = 1024 * 1024;
+
+/**
+ * The model selection a session's runtime last recorded, read backwards from the end of its event log
+ * through root (non-sub-agent) `session.start`, `session.resume`, and `session.model_change` events.
+ * A field an event leaves out comes from older events (an effort-only change carries no context tier).
+ * Fusion Auto levels are recorded as `autoTierIdCompat`, other levels as `autoTier`. Changing only the
+ * Auto level records nothing, so a newer level can be known only to the live bridge.
+ */
+export function readRecordedModelState(eventsPath: string): RecordedModelState {
+  const state: RecordedModelState = {};
+  let fd: number;
+  try {
+    fd = fs.openSync(eventsPath, "r");
+  } catch {
+    return state;
+  }
+  const found = { model: false, reasoningEffort: false, contextTier: false, autoTier: false };
+  try {
+    let pos = fs.fstatSync(fd).size;
+    let carry: Buffer = Buffer.alloc(0);
+    let scanned = 0;
+    let reachedStart = false;
+    while (pos > 0 && scanned < MODEL_STATE_MAX_SCAN_BYTES && !reachedStart) {
+      const len = Math.min(MODEL_STATE_CHUNK_BYTES, pos);
+      pos -= len;
+      scanned += len;
+      const chunk = Buffer.alloc(len);
+      fs.readSync(fd, chunk, 0, len, pos);
+      const buf = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      // The bytes before the first newline belong to a line that starts in an earlier chunk.
+      const firstNewline = pos > 0 ? buf.indexOf(0x0a) : -1;
+      const complete = firstNewline >= 0 ? buf.subarray(firstNewline + 1) : pos > 0 ? Buffer.alloc(0) : buf;
+      const partial = firstNewline >= 0 ? buf.subarray(0, firstNewline) : pos > 0 ? buf : Buffer.alloc(0);
+      // Model events are small; a partial line this long is something else, so stop carrying it.
+      carry = partial.length > MODEL_STATE_MAX_LINE_BYTES ? Buffer.alloc(0) : Buffer.from(partial);
+      const lines = complete.toString("utf8").split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (line.length > MODEL_STATE_MAX_LINE_BYTES || !MODEL_STATE_EVENT.test(line)) continue;
+        let ev: { type?: string; agentId?: unknown; data?: Record<string, unknown> };
+        try {
+          ev = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (ev.agentId) continue;
+        const data = ev.data || {};
+        const isChange = ev.type === "session.model_change";
+        if (!isChange && ev.type !== "session.start" && ev.type !== "session.resume") continue;
+        const model = isChange ? data.newModel : data.selectedModel;
+        if (!found.model && typeof model === "string" && model) {
+          state.model = model;
+          found.model = true;
+          // Levels recorded before the session left Auto don't describe it now, and Auto has no effort.
+          if (model !== "auto") found.autoTier = true;
+          else found.reasoningEffort = true;
+        }
+        if (!found.contextTier && "contextTier" in data) {
+          state.contextTier = data.contextTier === "long_context" ? "long_context" : "default";
+          found.contextTier = true;
+        }
+        if (!found.reasoningEffort && "reasoningEffort" in data) {
+          if (typeof data.reasoningEffort === "string" && data.reasoningEffort) state.reasoningEffort = data.reasoningEffort;
+          found.reasoningEffort = true;
+        }
+        const tier = data.autoTier ?? data.autoTierIdCompat;
+        if (!found.autoTier && typeof tier === "string" && tier) {
+          state.autoTier = tier;
+          found.autoTier = true;
+        } else if (!found.autoTier && isChange && model === "auto" && data.previousModel !== "auto") {
+          // The session entered Auto here without recording a level; levels before this are stale.
+          found.autoTier = true;
+        }
+        if (ev.type === "session.start" || Object.values(found).every(Boolean)) {
+          reachedStart = true;
+          break;
+        }
+      }
+    }
+  } catch {
+    // Best effort: return what was found.
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (state.model && state.model !== "auto") delete state.autoTier;
+  if (state.model === "auto") delete state.reasoningEffort; // Auto has no effort setting.
+  return state;
+}
+
 export class SessionStateStore {
   private allowedRootsCache: string[] = [];
   private artifactPathCache = new Map<
@@ -179,6 +282,7 @@ export class SessionStateStore {
   private allowedRootsLastUpdated = 0;
   private quotaCache: { data: CopilotQuotaStatus | null; cachedAt: number } | null = null;
   private sessionsListCache: { list: RemoteSessionSummary[]; cachedAt: number } | null = null;
+  private recordedModelStates = new Map<string, { key: string; state: RecordedModelState; at: number }>();
   private quickCountsCache = new Map<
     string,
     { counts: RemoteSessionSummary["counts"]; cachedAt: number }
@@ -442,46 +546,89 @@ export class SessionStateStore {
     }
   }
 
-  getAvailableModels(): Array<{ id: string; name: string }> {
-    const fallback = [
-      { id: "auto", name: "Auto" },
-      { id: "gemini-4-argon", name: "Gemini 4 Argon" },
-      { id: "claude-opus-5.5", name: "Claude Opus 5.5" },
-      { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5" },
-      { id: "claude-sonnet-5", name: "Claude Sonnet 5" },
-      { id: "claude-haiku-5.5", name: "Claude Haiku 5.5" },
-      { id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
-      { id: "gpt-6-sol", name: "GPT-6 Sol" },
-      { id: "gpt-6-luna", name: "GPT-6 Luna" },
-      { id: "gpt-6-astra", name: "GPT-6 Astra" },
-      { id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-      { id: "gpt-5.5", name: "GPT-5.5" },
-      { id: "gpt-5.4", name: "GPT-5.4" },
-      { id: "gpt-5.3-codex", name: "GPT-5.3-Codex" },
-      { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      { id: "grok-4.7", name: "Grok 4.7" },
-    ];
+  /** The desktop app's cached model list (fallback when it can't be asked directly). */
+  getAvailableModels(): CatalogModel[] {
+    const appState = this.readAppStateValues(["copilot-available-models-v2", "copilot-cloud-available-models-v2"]);
+    for (const value of appState) {
+      const models = modelsFromAppState(value);
+      if (models.length > 0) return models;
+    }
+    return [{ id: "auto", name: "Auto", enabled: true, efforts: [] }];
+  }
+
+  /** The Auto tier the desktop app uses by default for new selections. */
+  getDefaultAutoTier(): string | undefined {
+    const [value] = this.readAppStateValues(["copilot-auto-tier"]);
+    return value && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined;
+  }
+
+  /** A session's persisted model selection in data.db, however old the session. Null when it isn't there. */
+  getSessionModelConfig(sessionId: string): { model?: string; reasoningEffort?: string; contextTier?: string } | null {
     try {
-      if (!fs.existsSync(DATA_DB_PATH)) return fallback;
+      if (!fs.existsSync(DATA_DB_PATH)) return null;
       const db = new DatabaseSync(DATA_DB_PATH, { open: true, readOnly: true });
       try {
         const row = db
-          .prepare("SELECT value FROM app_state WHERE key = 'copilot-available-models-v2'")
-          .get() as { value?: string } | undefined;
-        if (row?.value) {
-          const parsed = JSON.parse(row.value) as Array<{ id?: string; name?: string }>;
-          const list = parsed
-            .filter((m) => Boolean(m.id))
-            .map((m) => ({ id: String(m.id), name: String(m.name || m.id) }));
-          if (list.length > 0) return list;
-        }
+          .prepare("SELECT model, reasoning_effort, context_tier FROM sessions WHERE id = ?")
+          .get(sessionId) as { model?: string | null; reasoning_effort?: string | null; context_tier?: string | null } | undefined;
+        if (!row) return null;
+        return {
+          model: row.model || undefined,
+          reasoningEffort: row.reasoning_effort || undefined,
+          contextTier: row.context_tier || undefined,
+        };
       } finally {
         db.close();
       }
     } catch {
-      // Ignore
+      return null;
     }
-    return fallback;
+  }
+
+  /**
+   * See `readRecordedModelState`. Cached until the session's event log changes; `maxStaleMs` lets callers
+   * that only display the result reuse it for a while, since busy sessions change their log constantly.
+   */
+  getRecordedModelState(sessionId: string, maxStaleMs = 0): RecordedModelState {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return {};
+    const eventsPath = path.join(SESSION_STATE_DIR, sessionId, "events.jsonl");
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(eventsPath);
+    } catch {
+      return {};
+    }
+    const key = `${stat.size}:${stat.mtimeMs}`;
+    const cached = this.recordedModelStates.get(sessionId);
+    if (cached && (cached.key === key || Date.now() - cached.at < maxStaleMs)) return cached.state;
+    const state = readRecordedModelState(eventsPath);
+    this.recordedModelStates.delete(sessionId);
+    this.recordedModelStates.set(sessionId, { key, state, at: Date.now() });
+    if (this.recordedModelStates.size > 500) {
+      const oldest = this.recordedModelStates.keys().next().value;
+      if (oldest) this.recordedModelStates.delete(oldest);
+    }
+    return state;
+  }
+
+  private readAppStateValues(keys: string[]): string[] {
+    try {
+      if (!fs.existsSync(DATA_DB_PATH)) return [];
+      const db = new DatabaseSync(DATA_DB_PATH, { open: true, readOnly: true });
+      try {
+        const stmt = db.prepare("SELECT value FROM app_state WHERE key = ?");
+        const values: string[] = [];
+        for (const key of keys) {
+          const row = stmt.get(key) as { value?: string } | undefined;
+          if (row?.value) values.push(row.value);
+        }
+        return values;
+      } finally {
+        db.close();
+      }
+    } catch {
+      return [];
+    }
   }
 
   updateSessionConfigInDb(
@@ -911,6 +1058,11 @@ export class SessionStateStore {
     }
   }
 
+  /** Drops the short-lived session list cache, e.g. after a model or mode change the app just persisted. */
+  invalidateSessionsList(): void {
+    this.sessionsListCache = null;
+  }
+
   listSessions(liveWorkspaces?: Map<string, Record<string, unknown>>): RemoteSessionSummary[] {
     if (
       this.sessionsListCache &&
@@ -1053,7 +1205,9 @@ export class SessionStateStore {
               mode: (["interactive", "plan", "autopilot"].includes(String(row.mode))
                 ? String(row.mode)
                 : "interactive") as SessionMode,
-              model: String(liveSession?.model || row.model || "auto"),
+              // The app writes the selection to its DB on every change; its workspace snapshot can lag.
+              model: String(row.model || liveSession?.model || "auto"),
+              modelUnset: !row.model && !liveSession?.model,
               reasoningEffort: row.reasoning_effort ? String(row.reasoning_effort) : undefined,
               contextTier: row.context_tier ? String(row.context_tier) : "default",
               projectId: row.project_id ? String(row.project_id) : undefined,
@@ -1334,6 +1488,7 @@ export class SessionStateStore {
     awaitingPermission: PendingPermissionRequest | null;
     selectedModel?: string;
     reasoningEffort?: string;
+    autoTier?: string;
     sessionCwd?: string;
   } {
     const folder = path.join(SESSION_STATE_DIR, sessionId);
@@ -1498,6 +1653,7 @@ export class SessionStateStore {
     let awaitingPermission: PendingPermissionRequest | null = null;
     let selectedModel: string | undefined;
     let reasoningEffort: string | undefined;
+    let autoTier: string | undefined;
 
     const extractReferencedArtifacts = (textOrJson: string): ArtifactItem[] => {
       if (!textOrJson) return [];
@@ -1543,6 +1699,7 @@ export class SessionStateStore {
           if (type === "session.start") {
             if (typeof data.selectedModel === "string") selectedModel = data.selectedModel;
             if (typeof data.reasoningEffort === "string") reasoningEffort = data.reasoningEffort;
+            if (typeof data.autoTier === "string") autoTier = data.autoTier;
             const ctx = data.context as Record<string, unknown> | undefined;
             if (ctx && typeof ctx.cwd === "string" && !sessionCwd) {
               sessionCwd = ctx.cwd;
@@ -1980,6 +2137,7 @@ export class SessionStateStore {
       awaitingPermission,
       selectedModel,
       reasoningEffort,
+      autoTier,
       sessionCwd,
     };
     this.sessionDetailCache.delete(sessionId);

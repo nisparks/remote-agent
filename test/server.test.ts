@@ -287,6 +287,33 @@ describe("RemoteAgentServer & Desktop Copilot Bridge", () => {
     assert.equal(delRes.status, 200);
   });
 
+  it("never sends an Auto level a session hasn't confirmed, and offers plain Auto when it can't ask", async () => {
+    // An unknown session can't list its own models. Any Auto levels shown for it are the account's, flagged
+    // unverified; confirming them means loading the session, which fails, so no level is ever sent.
+    const sessionId = "test-model-session-does-not-exist";
+    const modelsRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/models?token=${testToken}`);
+    assert.equal(modelsRes.status, 200);
+    const catalog = (await modelsRes.json()) as {
+      models: unknown[];
+      autoTiers: unknown[];
+      autoTiersUnverified?: boolean;
+      sessionId: string;
+    };
+    assert.ok(Array.isArray(catalog.models));
+    assert.equal(catalog.sessionId, sessionId);
+    assert.ok(catalog.autoTiers.length === 0 || catalog.autoTiersUnverified === true);
+
+    const switchRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/config?token=${testToken}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "auto", autoTier: "hydrafusion" }),
+    });
+    // 503 without a desktop app, 404 for a session it doesn't know; never sent either way.
+    assert.ok([400, 404, 503].includes(switchRes.status), `unexpected status ${switchRes.status}`);
+    const body = (await switchRes.json()) as { error?: string };
+    assert.ok(body.error);
+  });
+
   it("accepts authenticated WebSocket connections on /ws and sends initial state", async () => {
     const wsUrl = `${baseUrl.replace(/^http/, "ws")}/ws?token=${testToken}`;
     const firstMsg = await new Promise<Record<string, unknown>>((resolve, reject) => {

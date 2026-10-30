@@ -143,8 +143,14 @@ export interface RemoteSessionSummary {
   activityStatus: "busy" | "idle";
   mode: SessionMode;
   model: string;
+  /** True when no model is recorded for the session, so `model` is only a placeholder. */
+  modelUnset?: boolean;
   reasoningEffort?: string;
   contextTier?: string;
+  /** Auto routing tier, when the session uses the Auto model and its tier is known. */
+  autoTier?: string;
+  /** A model change waiting for the session's current turn to end. */
+  pendingModel?: { model: string; reasoningEffort?: string; contextTier?: string; autoTier?: string };
   projectId?: string;
   projectName?: string;
   repository?: string;

@@ -6,6 +6,8 @@ import path from "node:path";
 import type { DeliveryMode, SessionMode } from "./types.js";
 
 const RUN_DIR = path.join(os.homedir(), ".copilot", "run");
+// `session.model_change` sources that mean someone chose a model in the desktop app itself.
+const EXTERNAL_MODEL_SOURCES = new Set(["model_picker", "model_command", "settings_command", "config_command"]);
 
 export interface DesktopConnectionInfo {
   port: number;
@@ -26,9 +28,21 @@ export class DesktopAppBridge extends EventEmitter {
       resolve: (data: Record<string, unknown>) => void;
       reject: (err: Error) => void;
       timer: NodeJS.Timeout;
+      /** For requests answered in several messages: true once `msg` is the final answer. */
+      isFinal?: (msg: Record<string, unknown>) => boolean;
     }
   >();
   private liveWorkspaces = new Map<string, Record<string, unknown>>();
+  private sessionAutoTiers = new Map<string, string>();
+  /** Changes the app queued because the session was mid-turn; cleared when the runtime applies one. */
+  private queuedSelections = new Map<
+    string,
+    { model: string; reasoningEffort?: string; contextTier?: string; autoTier?: string }
+  >();
+  /** Whether each session is mid-turn, from its own root turn events (absent until one is seen). */
+  private busySessions = new Map<string, boolean>();
+  /** The last model this bridge asked each session to switch to, to tell the app's echoes apart. */
+  private lastSentModels = new Map<string, { model: string; at: number }>();
   private streamingBuffers = new Map<
     string,
     { content: string; reasoning: string; updatedAt: number }
@@ -157,6 +171,10 @@ export class DesktopAppBridge extends EventEmitter {
         this.connected = false;
         this.ws = null;
         this.emit("status", { connected: false, port: null, pid: null });
+        // None of these can be observed while disconnected, and a restarted app starts over.
+        this.queuedSelections.clear();
+        this.sessionAutoTiers.clear();
+        this.busySessions.clear();
         this.scheduleReconnect(3000);
       };
     } catch {
@@ -168,15 +186,18 @@ export class DesktopAppBridge extends EventEmitter {
   private handleServerMessage(msg: Record<string, unknown>): void {
     const type = String(msg.type || "");
     const reqId = typeof msg.request_id === "string" ? msg.request_id : undefined;
+    const isOwnReply = reqId !== undefined && this.pendingRequests.has(reqId);
 
     if (reqId && this.pendingRequests.has(reqId)) {
       const pending = this.pendingRequests.get(reqId)!;
-      clearTimeout(pending.timer);
-      this.pendingRequests.delete(reqId);
-      if (type === "error") {
-        pending.reject(new Error(String(msg.message || "Desktop WebSocket error")));
-      } else {
-        pending.resolve(msg);
+      if (type === "error" || !pending.isFinal || pending.isFinal(msg)) {
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(reqId);
+        if (type === "error") {
+          pending.reject(new Error(String(msg.message || "Desktop WebSocket error")));
+        } else {
+          pending.resolve(msg);
+        }
       }
     }
 
@@ -195,6 +216,11 @@ export class DesktopAppBridge extends EventEmitter {
       const evData = (ev.data as Record<string, unknown>) || {};
 
       if (sessionId) {
+        if (!ev.agentId) {
+          // Root turn events (sub-agents carry an agentId) say whether the session is mid-turn.
+          if (evType === "assistant.turn_start" || evType === "user.message") this.busySessions.set(sessionId, true);
+          else if (evType === "session.idle") this.busySessions.set(sessionId, false);
+        }
         if (evType === "assistant.message_delta") {
           const delta = String(evData.deltaContent || "");
           const buf = this.streamingBuffers.get(sessionId) || {
@@ -221,6 +247,35 @@ export class DesktopAppBridge extends EventEmitter {
           evType === "user.message"
         ) {
           this.streamingBuffers.delete(sessionId);
+        } else if (evType === "session.model_change" && !ev.agentId) {
+          // Sub-agent switches (with an agentId) don't change the session's own model.
+          const queued = this.queuedSelections.get(sessionId);
+          this.queuedSelections.delete(sessionId);
+          const newModel = typeof evData.newModel === "string" ? evData.newModel : "";
+          // Fusion levels are recorded as autoTierIdCompat. The event may carry neither, so fall back
+          // to a change queued from here.
+          const recorded = evData.autoTier ?? evData.autoTierIdCompat;
+          const tier =
+            typeof recorded === "string" && recorded
+              ? recorded
+              : queued?.model === "auto"
+                ? queued.autoTier
+                : undefined;
+          if (newModel === "auto" && tier) {
+            this.sessionAutoTiers.set(sessionId, tier);
+          } else if (newModel && newModel !== "auto") {
+            this.sessionAutoTiers.delete(sessionId);
+          }
+          // A choice made in the desktop app replaces any choice still waiting here.
+          if (typeof evData.source === "string" && EXTERNAL_MODEL_SOURCES.has(evData.source)) {
+            this.emit("external_model_change", { sessionId });
+          }
+        } else if (evType === "session.idle" && !ev.agentId) {
+          // Queued changes apply as the turn ends. Changing only the Auto level emits no model_change
+          // event, so treat whatever is still queued as applied once the session is idle.
+          const queued = this.queuedSelections.get(sessionId);
+          this.queuedSelections.delete(sessionId);
+          if (queued?.model === "auto" && queued.autoTier) this.sessionAutoTiers.set(sessionId, queued.autoTier);
         }
       }
 
@@ -228,6 +283,33 @@ export class DesktopAppBridge extends EventEmitter {
         sessionId,
         event: ev,
       });
+    } else if (type === "session_model_result" && !isOwnReply && typeof msg.session_id === "string") {
+      // Pushed when a session's selection is restored (on resume, with a history_request_id) or changed
+      // by another client.
+      const model = typeof msg.model === "string" ? msg.model : "";
+      const tier = typeof msg.auto_tier === "string" ? msg.auto_tier : "";
+      if (model === "auto" && tier) this.sessionAutoTiers.set(msg.session_id, tier);
+      else if (model && model !== "auto") this.sessionAutoTiers.delete(msg.session_id);
+      if (!msg.history_request_id && model && !this.isEchoOfOwnSwitch(msg.session_id, model)) {
+        this.emit("external_model_change", { sessionId: msg.session_id });
+      }
+    } else if (type === "session_model_queued" && !isOwnReply && typeof msg.session_id === "string") {
+      // Another client (e.g. the desktop picker) queued a change for the end of the current turn. The app
+      // may also echo our own queued changes this way, so keep fields the echo leaves out.
+      if (typeof msg.model === "string" && msg.model) {
+        const text = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+        const known = this.queuedSelections.get(msg.session_id);
+        const same = known?.model === msg.model ? known : undefined;
+        this.queuedSelections.set(msg.session_id, {
+          model: msg.model,
+          reasoningEffort: text(msg.reasoning_effort) ?? same?.reasoningEffort,
+          contextTier: text(msg.context_tier) ?? same?.contextTier,
+          autoTier: text(msg.auto_tier) ?? same?.autoTier,
+        });
+        if (!this.isEchoOfOwnSwitch(msg.session_id, msg.model)) {
+          this.emit("external_model_change", { sessionId: msg.session_id });
+        }
+      }
     } else if (
       type === "user_input_request" ||
       type === "exit_plan_mode_request" ||
@@ -253,7 +335,8 @@ export class DesktopAppBridge extends EventEmitter {
 
   async request(
     payload: Record<string, unknown>,
-    timeoutMs = 6000
+    timeoutMs = 6000,
+    isFinal?: (msg: Record<string, unknown>) => boolean
   ): Promise<Record<string, unknown>> {
     if (!this.ws || !this.connected) {
       throw new Error("Desktop GitHub Copilot app WebSocket is not connected");
@@ -267,7 +350,7 @@ export class DesktopAppBridge extends EventEmitter {
         reject(new Error(`Timed out waiting for Desktop response to ${String(payload.type)}`));
       }, timeoutMs);
 
-      this.pendingRequests.set(requestId, { resolve, reject, timer });
+      this.pendingRequests.set(requestId, { resolve, reject, timer, isFinal });
       const sent = this.sendRaw(fullPayload);
       if (!sent) {
         clearTimeout(timer);
@@ -374,26 +457,115 @@ export class DesktopAppBridge extends EventEmitter {
     });
   }
 
-  setSessionModel(
+  /** The desktop app's live model catalog: `{ type: "models_list", models, auto_tiers }`. */
+  async listModels(): Promise<Record<string, unknown>> {
+    const reply = await this.request({ type: "list_models" }, 10_000);
+    if (reply.type !== "models_list") {
+      throw new Error(`Unexpected reply to list_models: ${String(reply.type)}`);
+    }
+    return reply;
+  }
+
+  /**
+   * One session's own model list: `{ type: "session_models_list", models, auto_tiers? }`. Sessions can run
+   * under different accounts, so this decides which models and Auto levels the session accepts.
+   * `auto_tiers` is absent for sessions without Auto levels. Errors while the session isn't loaded.
+   */
+  async listSessionModels(sessionId: string): Promise<Record<string, unknown>> {
+    const reply = await this.request({ type: "list_session_models", session_id: sessionId }, 10_000);
+    if (reply.type !== "session_models_list") {
+      throw new Error(`Unexpected reply to list_session_models: ${String(reply.type)}`);
+    }
+    return reply;
+  }
+
+  /**
+   * Loads a session's runtime the way opening it in the desktop app does. Resolves on `session_resumed`;
+   * the history the app streams for the same request afterwards is ignored.
+   */
+  async resumeSession(sessionId: string): Promise<Record<string, unknown>> {
+    return this.request({ type: "resume_session", session_id: sessionId }, 20_000, (m) => m.type === "session_resumed");
+  }
+
+  /** Whether the session is mid-turn, by its own turn events; undefined until one has been seen. */
+  isSessionBusy(sessionId: string): boolean | undefined {
+    return this.busySessions.get(sessionId);
+  }
+
+  /** True when a pushed model change is the app echoing a switch this bridge just sent. */
+  private isEchoOfOwnSwitch(sessionId: string, model: string): boolean {
+    const sent = this.lastSentModels.get(sessionId);
+    return Boolean(sent && sent.model === model && Date.now() - sent.at < 15_000);
+  }
+
+  /**
+   * Switches a session's model through the desktop app and waits for its verdict. Resolves with the
+   * selection the app applied, or with `queued` when the session is mid-turn and the app will apply it
+   * once the turn ends. Rejects with the app's reason when it refuses the change.
+   */
+  async setSessionModel(
     sessionId: string,
-    model: string,
-    reasoningEffort?: string,
-    contextTier?: string
-  ): boolean {
+    selection: { model: string; reasoningEffort?: string; contextTier?: string; autoTier?: string }
+  ): Promise<{
+    model: string;
+    reasoningEffort?: string;
+    contextTier?: string;
+    autoTier?: string;
+    queued: boolean;
+    notice?: string;
+  }> {
     const payload: Record<string, unknown> = {
       type: "set_session_model",
       session_id: sessionId,
-      model,
+      model: selection.model,
     };
-    if (reasoningEffort) {
-      payload.reasoning_effort = reasoningEffort;
-      payload.reasoningEffort = reasoningEffort;
+    if (selection.reasoningEffort) payload.reasoning_effort = selection.reasoningEffort;
+    if (selection.contextTier) payload.context_tier = selection.contextTier;
+    if (selection.autoTier) payload.auto_tier = selection.autoTier;
+    const finalTypes = ["session_model_result", "session_model_queued", "session_model_change_rejected", "session_auto_tier_dropped"];
+    this.lastSentModels.set(sessionId, { model: selection.model, at: Date.now() });
+    const reply = await this.request(payload, 15_000, (m) => finalTypes.includes(String(m.type)));
+    const text = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+    if (reply.type === "session_model_change_rejected") {
+      throw new Error(text(reply.warning) ?? text(reply.message) ?? "The desktop app rejected the model change.");
     }
-    if (contextTier) {
-      payload.context_tier = contextTier;
-      payload.contextTier = contextTier;
+    const applied = {
+      model: text(reply.model) ?? selection.model,
+      reasoningEffort: text(reply.reasoning_effort) ?? text(reply.reasoningEffort),
+      contextTier: text(reply.context_tier) ?? text(reply.contextTier),
+      autoTier: text(reply.auto_tier) ?? text(reply.autoTier) ?? selection.autoTier,
+      queued: reply.type === "session_model_queued",
+      notice: undefined as string | undefined,
+    };
+    if (reply.type === "session_auto_tier_dropped") {
+      const effective = text(reply.effective_auto_tier);
+      applied.autoTier = effective;
+      applied.notice = `The ${text(reply.requested_auto_tier) ?? "requested"} Auto level isn't available for this session; using ${effective ?? "the default"}.`;
     }
-    return this.sendRaw(payload);
+    if (applied.queued) {
+      this.queuedSelections.set(sessionId, {
+        model: applied.model,
+        reasoningEffort: applied.reasoningEffort,
+        contextTier: applied.contextTier ?? selection.contextTier,
+        autoTier: applied.autoTier,
+      });
+    } else {
+      this.queuedSelections.delete(sessionId);
+      if (applied.model === "auto" && applied.autoTier) this.sessionAutoTiers.set(sessionId, applied.autoTier);
+    }
+    return applied;
+  }
+
+  /** A model change the app is holding until the session's current turn ends, if any. */
+  getQueuedSelection(
+    sessionId: string
+  ): { model: string; reasoningEffort?: string; contextTier?: string; autoTier?: string } | undefined {
+    return this.queuedSelections.get(sessionId);
+  }
+
+  /** Last Auto tier seen for a session (from model switches made here or reported by the app). */
+  getSessionAutoTier(sessionId: string): string | undefined {
+    return this.sessionAutoTiers.get(sessionId);
   }
 
   abortSession(sessionId: string): boolean {
