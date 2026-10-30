@@ -14,7 +14,7 @@
     "build:apk": "node scripts/build-android-apk.mjs",
     "build:desktop": "node scripts/build-desktop-app.mjs",
     "deploy:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
-    "test": "node --no-warnings --import tsx --test test/server.test.ts test/reliability.test.ts test/model-catalog.test.ts test/recorded-model-state.test.ts"
+    "test": "node --no-warnings --import tsx --test test/server.test.ts test/reliability.test.ts test/model-catalog.test.ts test/model-controls.test.ts test/recorded-model-state.test.ts"
   },
   "dependencies": {
     "qrcode": "^1.5.4",

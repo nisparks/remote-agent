@@ -175,10 +175,17 @@
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                   <input id="fileUploadInput" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.md,.json,.txt" multiple style="display: none;" />
                 </label>
-                <select id="sessionModelSelect" class="composer-meta-select" title="Model">
+                <button id="sessionFusionToggle" type="button" class="composer-fusion-toggle" role="switch" aria-checked="false" aria-label="Copilot Fusion" style="display: none;">
+                  <span>Copilot Fusion</span>
+                  <span class="composer-switch-track" aria-hidden="true"></span>
+                </button>
+                <select id="sessionModelSelect" class="composer-meta-select" title="Model" aria-label="Model">
                   <option value="auto">Auto</option>
                 </select>
-                <select id="sessionAutoTierSelect" class="composer-meta-select" title="Auto routing tier" style="display: none;"></select>
+                <label id="sessionAutoTierControl" class="composer-model-level" style="display: none;">
+                  <span>Effort level</span>
+                  <select id="sessionAutoTierSelect" class="composer-meta-select" aria-label="Copilot Fusion effort level"></select>
+                </label>
                 <select id="sessionEffortSelect" class="composer-meta-select" title="Reasoning effort">
                   <option value="high" selected>High</option>
                 </select>

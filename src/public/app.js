@@ -692,6 +692,14 @@ function handleLiveWsMessage(msg) {
       showToast(`Couldn't change the model: ${msg.error}`, "error", 8000);
       scheduleActiveSessionRefresh(300);
     }
+  } else if (msg.type === "models_updated") {
+    // The desktop's offering changed (models, levels, or policy): redraw from the server's fresh copy.
+    modelCatalogLoadedAt = 0;
+    void loadModelCatalog();
+    if (state.activeSessionId && (!msg.sessionId || msg.sessionId === state.activeSessionId)) {
+      if (sessionModelCatalog) sessionModelCatalog.loadedAt = 0;
+      void loadSessionModelCatalog(state.activeSessionId);
+    }
   } else if (msg.type === "wan_status") {
     if (state.hostStatus && msg.wan) {
       state.hostStatus.wan = msg.wan;
@@ -1199,20 +1207,62 @@ function updateHostBanner() {
   }
 }
 
-// --- Model picker: the live catalog from the desktop Copilot app (models, efforts, Auto tiers) ---
-const EFFORT_LABELS = { none: "No effort", low: "Low", medium: "Medium", high: "High", xhigh: "XHigh", max: "Max" };
-// Relative cost the service publishes for model pickers.
-const PRICE_LABELS = { low: "$", medium: "$$", high: "$$$", very_high: "$$$$" };
-const MODEL_GROUPS = [
-  ["powerful", "Powerful"],
-  ["versatile", "Versatile"],
-  ["lightweight", "Lightweight"],
-];
+// --- Model picker: the desktop app's live models, Copilot Fusion levels, efforts, and context windows ---
+// The server sends each catalog with the desktop picker's own layout (`picker`), so both list the same.
+const EFFORT_LABELS = { none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra High", max: "Max" };
 let modelCatalogLoadedAt = 0;
 let modelCatalogHost = null;
 // The open session's own list: which models and Auto levels it accepts (sessions can use other accounts).
 let sessionModelCatalog = null;
-const catalogSignature = (c) => JSON.stringify([c?.models || [], c?.autoTiers || [], c?.defaultAutoTier || ""]);
+const catalogSignature = (c) =>
+  JSON.stringify([c?.models || [], c?.autoTiers || [], c?.defaultAutoTier || "", c?.picker || null]);
+const rememberedModelSelections = new Map();
+const modelConfigRequests = new Set();
+const modelControlKey = () => JSON.stringify([state.activePeerId || "", state.activeSessionId]);
+
+function offersCopilotFusion(catalog = activeModelCatalog()) {
+  // Standard still has type "auto"; the whole routing family is branded Copilot Fusion.
+  return (catalog?.autoTiers || []).some((t) => t.kind === "fusion" && t.visible);
+}
+
+function rememberModelSelection(selection) {
+  if (!selection?.model || !state.activeSessionId) return;
+  const key = modelControlKey();
+  const remembered = rememberedModelSelections.get(key) || {};
+  if (selection.model === "auto") {
+    if (selection.autoTier) remembered.autoTier = selection.autoTier;
+  } else {
+    remembered.manual = {
+      model: selection.model,
+      reasoningEffort: selection.reasoningEffort,
+      contextTier: selection.contextTier || "default",
+    };
+  }
+  rememberedModelSelections.set(key, remembered);
+}
+
+function fusionSelection() {
+  const catalog = activeModelCatalog();
+  const tiers = catalog?.autoTiers || [];
+  const remembered = rememberedModelSelections.get(modelControlKey())?.autoTier;
+  const listed = catalog?.picker?.autoTiers;
+  const preferred = listed ? catalog.picker.defaultAutoTier : catalog?.defaultAutoTier;
+  const tier =
+    tiers.find((t) => t.id === remembered && t.enabled) ||
+    tiers.find((t) => t.id === preferred && t.enabled && (listed || t.visible)) ||
+    tiers.find((t) => t.enabled && (listed ? listed.includes(t.id) : t.visible));
+  return tier ? { model: "auto", autoTier: tier.id } : { model: "auto" };
+}
+
+/** The model Fusion hands back to: this session's last manual choice, else the desktop's latest pick. */
+function manualFallbackSelection() {
+  const catalog = activeModelCatalog();
+  const usable = (id) => (catalog?.models || []).some((m) => m.id === id && m.enabled && m.id !== "auto");
+  const manual = rememberedModelSelections.get(modelControlKey())?.manual;
+  if (manual && usable(manual.model)) return manual;
+  const recent = (catalog?.picker?.recent || []).find(usable);
+  return recent ? { model: recent } : null;
+}
 
 async function loadModelCatalog(force = false) {
   const host = state.activePeerId || "";
@@ -1273,32 +1323,47 @@ function catalogModel(id) {
   return (activeModelCatalog()?.models || []).find((m) => m.id === id) || state.modelCatalog?.models?.find((m) => m.id === id) || null;
 }
 
-function formatTokenWindow(tokens) {
-  if (!tokens) return "";
-  return tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(2))}M` : `${Math.round(tokens / 1000)}K`;
+function defaultEffortFor(model) {
+  // The desktop starts a model on its default effort (else Medium), else the weakest it offers.
+  const efforts = model?.efforts || [];
+  if (efforts.length === 0) return undefined;
+  const preferred = model.defaultEffort || "medium";
+  return efforts.includes(preferred) ? preferred : efforts.find((e) => e !== "none") || "none";
 }
 
-function defaultEffortFor(model) {
-  const efforts = model?.efforts || [];
-  if (model?.defaultEffort && efforts.includes(model.defaultEffort)) return model.defaultEffort;
-  return efforts.includes("high") ? "high" : efforts[efforts.length - 1];
+/** The model's "Context window" choices, labelled as the desktop does ("328K", "1.1M"). */
+function contextTierOptions(model) {
+  if (!model?.contextTiers && model?.longContextWindow) {
+    // An older desktop that sends only the windows.
+    return [{ id: "default", text: "Default context" }, { id: "long_context", text: "Long context" }];
+  }
+  const tiers = model?.contextTiers || [];
+  if (tiers.length < 2) return [];
+  const labels = tiers.map((t) => t.contextLabel);
+  const distinct = labels.every((l) => l) && new Set(labels).size === labels.length;
+  return tiers.map((t) => ({ id: t.id, text: distinct ? `${t.contextLabel} context` : t.label }));
 }
 
 function describeModelSelection(s) {
+  const catalog = activeModelCatalog();
   const model = catalogModel(s.model);
-  const parts = [model?.name || s.model];
+  const autoLabel = catalog?.picker?.autoLabel || (offersCopilotFusion() ? "Copilot Fusion" : "Auto");
+  const parts = [s.model === "auto" ? autoLabel : model?.name || s.model];
   if (s.model === "auto") {
-    const tier = (activeModelCatalog()?.autoTiers || []).find((t) => t.id === s.autoTier);
+    const tier = (catalog?.autoTiers || []).find((t) => t.id === s.autoTier);
     if (s.autoTier) parts.push(tier?.name || s.autoTier);
   } else {
     if (s.reasoningEffort) parts.push(EFFORT_LABELS[s.reasoningEffort] || s.reasoningEffort);
-    if (s.contextTier === "long_context" && model?.longContextWindow) parts.push(`${formatTokenWindow(model.longContextWindow)} ctx`);
+    if (s.contextTier === "long_context") {
+      const long = contextTierOptions(model).find((t) => t.id === "long_context");
+      if (long) parts.push(long.text);
+    }
   }
   return parts.join(" · ");
 }
 
 function setModelControlsBusy(busy) {
-  for (const id of ["sessionModelSelect", "sessionAutoTierSelect", "sessionEffortSelect", "sessionContextTierSelect"]) {
+  for (const id of ["sessionFusionToggle", "sessionModelSelect", "sessionAutoTierSelect", "sessionEffortSelect", "sessionContextTierSelect"]) {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
@@ -1314,25 +1379,48 @@ function renderModelControls() {
   const pending = s?.pendingModel || null;
   const sel = pending || s || {};
   const currentModel = sel.model || "auto";
-
-  const option = (m) => {
-    const notes = [PRICE_LABELS[m.priceCategory], m.discountPercent ? `${m.discountPercent}% off` : ""].filter(Boolean);
-    return `<option value="${escapeHtml(m.id)}"${m.enabled === false ? " disabled" : ""}>${escapeHtml(m.name)}${
-      notes.length ? ` · ${escapeHtml(notes.join(" · "))}` : ""
-    }${m.enabled === false ? " (blocked by policy)" : ""}</option>`;
-  };
-  let html = models.filter((m) => m.id === "auto").map(option).join("");
-  const grouped = new Set(["auto"]);
-  for (const [key, label] of MODEL_GROUPS) {
-    const list = models.filter((m) => m.id !== "auto" && m.category === key);
-    list.forEach((m) => grouped.add(m.id));
-    if (list.length) html += `<optgroup label="${label}">${list.map(option).join("")}</optgroup>`;
+  const isAuto = currentModel === "auto";
+  const hasFusion = offersCopilotFusion(catalog);
+  const busy = modelConfigRequests.has(modelControlKey());
+  if (!busy) {
+    rememberModelSelection(s);
+    rememberModelSelection(pending);
   }
-  const others = models.filter((m) => !grouped.has(m.id));
-  if (others.length) html += models.length > others.length ? `<optgroup label="Other">${others.map(option).join("")}</optgroup>` : others.map(option).join("");
-  if (!models.some((m) => m.id === currentModel)) {
-    // Keep the session's model visible even when this account no longer offers it.
-    html = `<option value="${escapeHtml(currentModel)}">${escapeHtml(currentModel)}${models.length ? " (not offered)" : ""}</option>${html}`;
+  setModelControlsBusy(busy);
+
+  const byId = new Map(models.map((m) => [m.id, m]));
+  const picker = catalog?.picker;
+  const autoLabel = picker?.autoLabel || (hasFusion ? "Copilot Fusion" : "Auto");
+  const option = (m, reason) => {
+    const isAutoModel = m.id === "auto";
+    const notes = isAutoModel && hasFusion ? [] : [m.badge, m.discountPercent ? `${m.discountPercent}% off` : ""].filter(Boolean);
+    const disabled = reason !== undefined || m.enabled === false;
+    return `<option value="${escapeHtml(m.id)}"${disabled ? " disabled" : ""}${reason ? ` title="${escapeHtml(reason)}"` : ""}>${escapeHtml(
+      isAutoModel ? autoLabel : m.name
+    )}${notes.length ? ` · ${escapeHtml(notes.join(" · "))}` : ""}${disabled && m.id === currentModel ? " (not available)" : ""}</option>`;
+  };
+  const listOptions = (ids) => ids.map((id) => byId.get(id)).filter(Boolean).map((m) => option(m)).join("");
+  // Auto (Copilot Fusion) leads, then the desktop's featured models, "More models", and "Disabled models".
+  let html = byId.has("auto") ? option(byId.get("auto")) : "";
+  let disabledList;
+  if (picker) {
+    html += listOptions(picker.featured || []);
+    if (picker.more?.length) html += `<optgroup label="More models">${listOptions(picker.more)}</optgroup>`;
+    disabledList = picker.disabled || [];
+  } else {
+    // An older desktop without the layout: its models in catalog order.
+    html += listOptions(models.filter((m) => m.id !== "auto" && m.enabled !== false).map((m) => m.id));
+    disabledList = models.filter((m) => m.id !== "auto" && m.enabled === false).map((m) => ({ id: m.id, reason: m.policyTerms || "" }));
+  }
+  const disabledOptions = disabledList
+    .map((d) => (byId.has(d.id) ? option(byId.get(d.id), d.reason || "This model isn't available to you.") : ""))
+    .join("");
+  if (disabledOptions) html += `<optgroup label="Disabled models">${disabledOptions}</optgroup>`;
+  if (!html.includes(`value="${escapeHtml(currentModel)}"`)) {
+    // Keep the session's model visible even when it isn't listed (not offered, or listed only as a level).
+    const known = byId.get(currentModel);
+    const label = known ? (currentModel === "auto" ? autoLabel : known.name) : currentModel;
+    html = `<option value="${escapeHtml(currentModel)}">${escapeHtml(label)}${known || !models.length ? "" : " (not offered)"}</option>${html}`;
   }
   modelSel.innerHTML = html || `<option value="auto">Auto</option>`;
   modelSel.value = currentModel;
@@ -1340,18 +1428,34 @@ function renderModelControls() {
   modelSel.title = pending ? "Switches when the current turn ends" : "Model";
 
   const model = catalogModel(currentModel);
-  const isAuto = currentModel === "auto";
+  const fusionToggle = document.getElementById("sessionFusionToggle");
+  if (fusionToggle) {
+    fusionToggle.style.display = hasFusion ? "" : "none";
+    fusionToggle.setAttribute("aria-checked", String(isAuto));
+    fusionToggle.classList.toggle("pending", Boolean(pending));
+    fusionToggle.title = pending
+      ? "Switches when the current turn ends"
+      : isAuto ? "Turn off Copilot Fusion and use a specific model" : "Let Copilot Fusion choose the models";
+    const canEnable = models.some((m) => m.id === "auto" && m.enabled) &&
+      (picker ? Boolean(picker.defaultAutoTier) : (catalog?.autoTiers || []).some((t) => t.enabled && t.visible));
+    fusionToggle.disabled = busy || (!isAuto && !canEnable);
+  }
 
   const tierSel = document.getElementById("sessionAutoTierSelect");
   if (tierSel) {
     const tiers = catalog?.autoTiers || [];
     const currentTier = sel.autoTier || "";
-    const shown = tiers.filter((t) => (t.visible && t.enabled) || t.id === currentTier);
+    // The levels the desktop lists (disabled ones too, so it's clear they exist), plus the session's own.
+    const listed = picker?.autoTiers || tiers.filter((t) => t.visible).map((t) => t.id);
+    const shown = tiers.filter((t) => listed.includes(t.id) || t.id === currentTier);
     if (isAuto && shown.length > 0) {
       let options = shown
         .map((t) => {
-          const promo = t.promo?.discountPercent ? ` · ${t.promo.discountPercent}% off` : "";
-          return `<option value="${escapeHtml(t.id)}"${t.enabled ? "" : " disabled"}>${escapeHtml(t.name)}${escapeHtml(promo)}</option>`;
+          const promo = t.enabled && t.promo?.discountPercent ? ` · ${t.promo.discountPercent}% off` : "";
+          const detail = t.enabled ? "" : ` title="${escapeHtml(t.statusMessage || t.description || "Not available")}"`;
+          return `<option value="${escapeHtml(t.id)}"${t.enabled ? "" : " disabled"}${detail}>${escapeHtml(t.name)}${escapeHtml(promo)}${
+            t.enabled ? "" : " (not available)"
+          }</option>`;
         })
         .join("");
       if (!currentTier) {
@@ -1365,11 +1469,15 @@ function renderModelControls() {
       const tier = shown.find((t) => t.id === currentTier);
       tierSel.title = tier
         ? `${tier.name}: ${tier.description}${tier.promo?.message ? ` ${tier.promo.message}` : ""}`
-        : "Auto level";
+        : hasFusion ? "Copilot Fusion effort level" : "Auto level";
+      tierSel.setAttribute("aria-label", hasFusion ? "Copilot Fusion effort level" : "Auto level");
       tierSel.style.display = "";
     } else {
       tierSel.style.display = "none";
     }
+    tierSel.classList.toggle("pending", Boolean(pending));
+    const tierControl = document.getElementById("sessionAutoTierControl");
+    if (tierControl) tierControl.style.display = tierSel.style.display;
   }
 
   const effortSel = document.getElementById("sessionEffortSelect");
@@ -1393,12 +1501,10 @@ function renderModelControls() {
 
   const ctxSel = document.getElementById("sessionContextTierSelect");
   if (ctxSel) {
-    if (!isAuto && model?.longContextWindow) {
-      const standard = formatTokenWindow(model.contextWindow);
-      ctxSel.innerHTML =
-        `<option value="default">${standard ? `${standard} ctx` : "Standard ctx"}</option>` +
-        `<option value="long_context">${formatTokenWindow(model.longContextWindow)} ctx</option>`;
-      ctxSel.value = sel.contextTier === "long_context" ? "long_context" : "default";
+    const tiers = isAuto ? [] : contextTierOptions(model);
+    if (tiers.length > 0) {
+      ctxSel.innerHTML = tiers.map((t) => `<option value="${escapeHtml(t.id)}">${escapeHtml(t.text)}</option>`).join("");
+      ctxSel.value = sel.contextTier === "long_context" && tiers.some((t) => t.id === "long_context") ? "long_context" : "default";
       ctxSel.style.display = "";
     } else {
       ctxSel.style.display = "none";
@@ -4454,16 +4560,24 @@ function setupEventListeners() {
   const updateSessionConfig = async (patch) => {
     if (!state.activeSessionId) return;
     const sessionId = state.activeSessionId;
+    const requestKey = modelControlKey();
+    const isCurrentSession = () => modelControlKey() === requestKey;
     const s = state.activeSession;
     const before = s
-      ? { model: s.model, reasoningEffort: s.reasoningEffort, contextTier: s.contextTier, autoTier: s.autoTier, mode: s.mode }
+      ? { model: s.model, reasoningEffort: s.reasoningEffort, contextTier: s.contextTier, autoTier: s.autoTier, mode: s.mode, pendingModel: s.pendingModel }
       : null;
     const isModelChange = ["model", "reasoningEffort", "contextTier", "autoTier"].some((k) => patch[k] !== undefined);
+    if (isModelChange) {
+      if (modelConfigRequests.has(requestKey)) return;
+      rememberModelSelection(s);
+      rememberModelSelection(s?.pendingModel);
+      modelConfigRequests.add(requestKey);
+    }
     if (s) {
       Object.assign(s, patch);
+      if (isModelChange && s.pendingModel) s.pendingModel = { ...s.pendingModel, ...patch };
       renderSessionHeader();
     }
-    if (isModelChange) setModelControlsBusy(true);
     try {
       // The desktop app validates and applies the switch; wait for its answer. Loading an idle session to
       // confirm its Auto levels can take a while, and the server gives up well before this.
@@ -4472,7 +4586,7 @@ function setupEventListeners() {
         body: patch,
         timeoutMs: 90_000,
       });
-      if (isModelChange && state.activeSession && state.activeSessionId === sessionId) {
+      if (isModelChange && state.activeSession && isCurrentSession()) {
         const selection = {
           model: result.model || patch.model || state.activeSession.model,
           reasoningEffort: result.reasoningEffort,
@@ -4480,6 +4594,7 @@ function setupEventListeners() {
           autoTier: result.autoTier,
         };
         const adjustments = Array.isArray(result.adjustments) ? result.adjustments : [];
+        rememberModelSelection(selection);
         if (result.queued) {
           // The app applies it when the current turn ends; until then the session keeps its model.
           Object.assign(state.activeSession, before ? { ...before, mode: state.activeSession.mode } : {});
@@ -4500,18 +4615,21 @@ function setupEventListeners() {
         }
       }
     } catch (err) {
-      if (s && before && state.activeSessionId === sessionId) {
-        Object.assign(s, before);
+      if (state.activeSession && before && isCurrentSession()) {
+        Object.assign(state.activeSession, before);
         renderSessionHeader();
       }
       const what = isModelChange ? "change the model" : "update the session";
-      showToast(`Couldn't ${what}: ${err.message}`, "error", 7000);
+      if (isCurrentSession()) showToast(`Couldn't ${what}: ${err.message}`, "error", 7000);
     } finally {
       if (isModelChange) {
-        setModelControlsBusy(false);
-        // The server now knows (and caches) whether this session really offers Auto levels.
-        sessionModelCatalog = null;
-        void loadSessionModelCatalog(sessionId);
+        modelConfigRequests.delete(requestKey);
+        if (isCurrentSession()) {
+          renderModelControls();
+          // The server now knows (and caches) whether this session really offers Fusion levels.
+          sessionModelCatalog = null;
+          void loadSessionModelCatalog(sessionId);
+        }
       }
     }
   };
@@ -4520,18 +4638,30 @@ function setupEventListeners() {
     updateSessionConfig({ mode: e.target.value });
   });
 
-  // Opening the picker refreshes stale catalogs so newly released models and Auto levels show up.
-  document.getElementById("sessionModelSelect")?.addEventListener("focus", () => {
-    void loadModelCatalog();
-    void loadSessionModelCatalog(state.activeSessionId);
+  for (const id of ["sessionModelSelect", "sessionFusionToggle", "sessionAutoTierSelect"]) {
+    document.getElementById(id)?.addEventListener("focus", () => {
+      void loadModelCatalog();
+      void loadSessionModelCatalog(state.activeSessionId);
+    });
+  }
+
+  document.getElementById("sessionFusionToggle")?.addEventListener("click", () => {
+    const s = state.activeSession?.pendingModel || state.activeSession;
+    if (!s || modelConfigRequests.has(modelControlKey())) return;
+    if (s.model !== "auto") return updateSessionConfig(fusionSelection());
+    const manual = manualFallbackSelection();
+    if (manual) return updateSessionConfig(manual);
+    // Nothing chosen before, here or in the desktop. Never pick a paid model on the user's behalf.
+    document.getElementById("sessionModelSelect")?.focus();
+    showToast("Choose a model to turn off Copilot Fusion.");
   });
 
   document.getElementById("sessionModelSelect")?.addEventListener("change", (e) => {
-    updateSessionConfig({ model: e.target.value });
+    return updateSessionConfig(e.target.value === "auto" && offersCopilotFusion() ? fusionSelection() : { model: e.target.value });
   });
 
   document.getElementById("sessionAutoTierSelect")?.addEventListener("change", (e) => {
-    updateSessionConfig({ autoTier: e.target.value });
+    return updateSessionConfig({ model: "auto", autoTier: e.target.value });
   });
 
   document.getElementById("sessionEffortSelect")?.addEventListener("change", (e) => {

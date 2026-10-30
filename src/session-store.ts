@@ -6,7 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { DETAIL_EVENT_TYPES, EventLogIndexer, JsonlLineScanner, fileIdentity } from "./event-log.js";
-import { modelsFromAppState, type CatalogModel } from "./model-catalog.js";
+import { modelsFromAppState, type CatalogModel, type DesktopModelPreferences } from "./model-catalog.js";
 import type {
   ArtifactCategory,
   ArtifactItem,
@@ -283,6 +283,7 @@ export class SessionStateStore {
   private quotaCache: { data: CopilotQuotaStatus | null; cachedAt: number } | null = null;
   private sessionsListCache: { list: RemoteSessionSummary[]; cachedAt: number } | null = null;
   private recordedModelStates = new Map<string, { key: string; state: RecordedModelState; at: number }>();
+  private modelPreferences: { at: number; prefs: DesktopModelPreferences } | null = null;
   private quickCountsCache = new Map<
     string,
     { counts: RemoteSessionSummary["counts"]; cachedAt: number }
@@ -562,6 +563,58 @@ export class SessionStateStore {
     return value && /^[A-Za-z0-9_.-]{1,64}$/.test(value) ? value : undefined;
   }
 
+  /**
+   * The desktop app's model preferences (recent models, default model, per-model effort and context, its
+   * feature flags), which shape its model picker. Read-only; cached briefly.
+   */
+  getDesktopModelPreferences(): DesktopModelPreferences {
+    if (this.modelPreferences && Date.now() - this.modelPreferences.at < 5_000) return this.modelPreferences.prefs;
+    const values = this.readAppStateMap([
+      "recent-models",
+      "copilot-selected-model",
+      "copilot-auto-tier",
+      "copilot-reasoning-effort",
+      "copilot-context-tier",
+      "enabled-experiments",
+    ]);
+    const parse = (key: string): unknown => {
+      try {
+        const value = values.get(key);
+        return value === undefined ? undefined : JSON.parse(value);
+      } catch {
+        return undefined;
+      }
+    };
+    const stringMap = (value: unknown): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        for (const [k, v] of Object.entries(value)) if (k && typeof v === "string") out[k] = v;
+      }
+      return out;
+    };
+    const entries = (parse("recent-models") as { state?: { entries?: Record<string, unknown> } } | undefined)?.state?.entries;
+    const recentModels = Object.values(entries && typeof entries === "object" ? entries : {})
+      .map((e) => e as { modelId?: unknown; openedAt?: unknown })
+      .filter((e) => typeof e.modelId === "string" && e.modelId.length > 0)
+      .sort((a, b) => (Number(b.openedAt) || 0) - (Number(a.openedAt) || 0))
+      .map((e) => e.modelId as string);
+    const experiments = parse("enabled-experiments");
+    const plain = (key: string) => {
+      const value = values.get(key);
+      return value && /^[A-Za-z0-9_.\/#:-]{1,128}$/.test(value) ? value : undefined;
+    };
+    const prefs: DesktopModelPreferences = {
+      recentModels,
+      defaultModel: plain("copilot-selected-model"),
+      autoTier: plain("copilot-auto-tier"),
+      effortByModel: stringMap(parse("copilot-reasoning-effort")),
+      contextTierByModel: stringMap(parse("copilot-context-tier")),
+      experiments: Array.isArray(experiments) ? experiments.filter((e): e is string => typeof e === "string") : undefined,
+    };
+    this.modelPreferences = { at: Date.now(), prefs };
+    return prefs;
+  }
+
   /** A session's persisted model selection in data.db, however old the session. Null when it isn't there. */
   getSessionModelConfig(sessionId: string): { model?: string; reasoningEffort?: string; contextTier?: string } | null {
     try {
@@ -612,23 +665,28 @@ export class SessionStateStore {
   }
 
   private readAppStateValues(keys: string[]): string[] {
+    const values = this.readAppStateMap(keys);
+    return keys.map((key) => values.get(key)).filter((v): v is string => v !== undefined);
+  }
+
+  private readAppStateMap(keys: string[]): Map<string, string> {
+    const values = new Map<string, string>();
     try {
-      if (!fs.existsSync(DATA_DB_PATH)) return [];
+      if (!fs.existsSync(DATA_DB_PATH)) return values;
       const db = new DatabaseSync(DATA_DB_PATH, { open: true, readOnly: true });
       try {
         const stmt = db.prepare("SELECT value FROM app_state WHERE key = ?");
-        const values: string[] = [];
         for (const key of keys) {
           const row = stmt.get(key) as { value?: string } | undefined;
-          if (row?.value) values.push(row.value);
+          if (row?.value) values.set(key, row.value);
         }
-        return values;
       } finally {
         db.close();
       }
     } catch {
-      return [];
+      // The desktop app's state is optional.
     }
+    return values;
   }
 
   updateSessionConfigInDb(

@@ -201,6 +201,11 @@ export class DesktopAppBridge extends EventEmitter {
       }
     }
 
+    // The app pushes its catalogs when they change (and in reply to its own UI's requests).
+    if (!isOwnReply && (type === "models_list" || type === "session_models_list") && Array.isArray(msg.models)) {
+      this.emit("catalog_changed", msg);
+    }
+
     if (type === "workspace_list" && Array.isArray(msg.workspaces)) {
       for (const ws of msg.workspaces as Array<Record<string, unknown>>) {
         const id = String(ws.activeSessionId || ws.id || "");

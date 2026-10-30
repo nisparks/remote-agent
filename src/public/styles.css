@@ -1152,16 +1152,79 @@ html, body {
   font-weight: 500;
   padding: 2px 4px;
   cursor: pointer;
+  max-width: 100%;
+}
+.composer-meta-select option,
+.composer-meta-select optgroup {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.composer-fusion-toggle,
+.composer-model-level {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+.composer-fusion-toggle {
+  min-height: 30px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  font-family: inherit;
+  cursor: pointer;
+}
+.composer-fusion-toggle[aria-checked="true"] {
+  color: var(--text-primary);
+}
+.composer-switch-track {
+  width: 28px;
+  height: 16px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  background: #484f58;
+}
+.composer-switch-track::after {
+  content: "";
+  display: block;
+  width: 12px;
+  height: 12px;
+  margin: 2px;
+  border-radius: 50%;
+  background: #f0f6fc;
+  transition: transform 0.12s ease;
+}
+.composer-fusion-toggle[aria-checked="true"] .composer-switch-track {
+  background: #3977ff;
+}
+.composer-fusion-toggle[aria-checked="true"] .composer-switch-track::after {
+  transform: translateX(12px);
+}
+.composer-model-level > span {
+  white-space: nowrap;
+}
+.composer-model-level select {
+  min-width: 0;
 }
 .composer-meta-select:focus {
   outline: none;
 }
-.composer-meta-select:disabled {
+.composer-fusion-toggle:focus-visible,
+.composer-meta-select:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+.composer-meta-select:disabled,
+.composer-fusion-toggle:disabled {
   opacity: 0.55;
   cursor: progress;
 }
 /* A model switch queued until the current turn ends. */
-.composer-meta-select.pending {
+.composer-meta-select.pending,
+.composer-fusion-toggle.pending {
   border-style: dashed;
   font-style: italic;
 }

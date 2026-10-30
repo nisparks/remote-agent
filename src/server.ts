@@ -14,6 +14,7 @@ import { DesktopAppBridge } from "./desktop-bridge.js";
 import { describeError, enableFileLogging, getLogFilePath, logEvent } from "./logger.js";
 import {
   applySessionModels,
+  buildModelPicker,
   normalizeDesktopCatalog,
   resolveModelSelection,
   type ModelCatalog,
@@ -462,6 +463,8 @@ export class RemoteAgentServer {
       if (this.modelIntents.delete(sessionId)) this.afterModelChange();
     });
 
+    this.bridge.on("catalog_changed", (raw: Record<string, unknown>) => this.onCatalogPushed(raw));
+
     this.bridge.on("session_event", ({ sessionId, event }) => {
       // Sub-agents report their own events; only the session's own idle means its turn has ended.
       if (event?.type === "session.idle" && !event.agentId && sessionId) {
@@ -880,6 +883,47 @@ export class RemoteAgentServer {
       if (oldest) this.sessionModelCatalogs.delete(oldest);
     }
     return catalog;
+  }
+
+  /**
+   * A catalog the desktop app pushed on its own (the offering changed, or its picker refreshed). It
+   * replaces the cached copy, and phones are told to reload their pickers when anything differs.
+   */
+  private onCatalogPushed(raw: Record<string, unknown>): void {
+    const signature = (c: ModelCatalog | null | undefined) =>
+      c ? JSON.stringify([c.models, c.autoTiers, c.defaultAutoTier]) : "";
+    const notify = (sessionId?: string) =>
+      this.broadcast({ type: "models_updated", sessionId, timestamp: new Date().toISOString() });
+    if (raw.type === "models_list") {
+      const catalog = normalizeDesktopCatalog(raw, "desktop");
+      if (catalog.models.length === 0) return;
+      const changed = signature(this.modelCatalog) !== signature(catalog);
+      this.modelCatalog = catalog;
+      this.modelCatalogStale = false;
+      if (!changed) return;
+      this.saveModelCatalog(raw);
+      this.sessionModelCatalogs.clear();
+      notify();
+      return;
+    }
+    const sessionId = typeof raw.session_id === "string" ? raw.session_id : "";
+    if (!sessionId || !this.modelCatalog) return;
+    const previous = this.sessionModelCatalogs.get(sessionId)?.catalog;
+    const catalog = applySessionModels(this.modelCatalog, raw, sessionId);
+    this.cacheSessionModelCatalog(sessionId, catalog, SESSION_MODEL_CATALOG_TTL_MS);
+    if (signature(previous) !== signature(catalog)) notify(sessionId);
+  }
+
+  /** A catalog with the desktop picker's layout for it, as the phone renders it. */
+  private withPicker(catalog: ModelCatalog, selection?: ModelSelection | null) {
+    return {
+      ...catalog,
+      picker: buildModelPicker(catalog, {
+        selectedModel: selection?.model,
+        currentAutoTier: selection?.autoTier,
+        prefs: this.store.getDesktopModelPreferences(),
+      }),
+    };
   }
 
   private afterModelChange(): void {
@@ -1584,7 +1628,7 @@ export class RemoteAgentServer {
       }
 
       if (pathname === "/api/models" && method === "GET") {
-        this.sendJson(res, 200, await this.getModelCatalog(parsedUrl.searchParams.get("refresh") === "1"));
+        this.sendJson(res, 200, this.withPicker(await this.getModelCatalog(parsedUrl.searchParams.get("refresh") === "1")));
         return;
       }
 
@@ -1959,11 +2003,8 @@ export class RemoteAgentServer {
         }
 
         if (subRoute === "models" && method === "GET") {
-          this.sendJson(
-            res,
-            200,
-            await this.getSessionModelCatalog(sessionId, parsedUrl.searchParams.get("refresh") === "1")
-          );
+          const catalog = await this.getSessionModelCatalog(sessionId, parsedUrl.searchParams.get("refresh") === "1");
+          this.sendJson(res, 200, this.withPicker(catalog, this.currentModelChoice(sessionId)));
           return;
         }
 
@@ -2033,7 +2074,7 @@ export class RemoteAgentServer {
           // Choices build on the newest one still waiting for the session's turn to end. Read it again:
           // the turn may have ended (and a held choice run) while the catalog loaded.
           const current = this.currentModelChoice(sessionId) ?? before;
-          const resolved = resolveModelSelection(catalog, current, patch);
+          const resolved = resolveModelSelection(catalog, current, patch, this.store.getDesktopModelPreferences());
           if (!resolved.ok) {
             this.sendJson(res, 400, { error: resolved.error });
             return;
